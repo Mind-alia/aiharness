@@ -1,0 +1,270 @@
+diff --git a/tests/test_defects.py b/tests/test_defects.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_defects.py
+@@ -0,0 +1,137 @@
++"""Tests unitaires de template/scripts/lib/defects.py : journal et LOG fabriqués dans un dossier temporaire."""
++import datetime
++import json
++from pathlib import Path
++import sys
++import tempfile
++import unittest
++
++LIB = Path(__file__).resolve().parents[1] / 'template/scripts/lib'
++sys.path.insert(0, str(LIB))
++
++import defects  # noqa: E402
++
++DEFECT = {'kind': 'defect', 'label': 'régression'}
++MARKER_LINE = '- Relecture : ' + defects.MARKER + ' régression sur le quota'
++
++
++class DefectsTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name).resolve()
++        self.path = self.root / '.workspace/events.jsonl'
++
++    def put(self, *rows):
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        with self.path.open('a', encoding='utf-8') as stream:
++            for at, task, event, detail in rows:
++                stream.write(json.dumps(dict(at=at, task_id=task, event=event, detail=detail)) + '\n')
++
++    def log(self, text):
++        (self.root / 'docs').mkdir(exist_ok=True)
++        (self.root / defects.LOG_PATH).write_text(text, encoding='utf-8')
++
++    def test_note_after_merge_is_counted_on_its_utc_day(self):
++        self.put(('2026-10-19T08:00:00+00:00', 'a', 'merged', None),
++                 ('2026-10-19T09:30:00+00:00', 'a', 'note', DEFECT))
++        self.assertEqual(defects.from_events(self.root), [datetime.date(2026, 10, 19)])
++
++    def test_outcome_and_question_answered_can_carry_a_defect(self):
++        self.put(('2026-10-19T08:00:00+00:00', 'a', 'merged', None),
++                 ('2026-10-19T09:00:00+00:00', 'a', 'outcome', DEFECT),
++                 ('2026-10-19T10:00:00+00:00', 'a', 'question_answered', DEFECT))
++        self.assertEqual(len(defects.from_events(self.root)), 2)
++
++    def test_defect_without_merge_is_ignored(self):
++        self.put(('2026-10-19T09:00:00+00:00', 'jamais', 'note', DEFECT))
++        self.assertEqual(defects.from_events(self.root), [])
++
++    def test_defect_dated_before_merge_is_ignored(self):
++        self.put(('2026-10-18T09:00:00+00:00', 'a', 'note', DEFECT),
++                 ('2026-10-19T08:00:00+00:00', 'a', 'merged', None))
++        self.assertEqual(defects.from_events(self.root), [])
++
++    def test_defect_at_the_merge_instant_is_ignored(self):
++        self.put(('2026-10-19T08:00:00+00:00', 'a', 'merged', None),
++                 ('2026-10-19T08:00:00+00:00', 'a', 'note', DEFECT))
++        self.assertEqual(defects.from_events(self.root), [])
++
++    def test_other_detail_or_other_event_is_not_a_defect(self):
++        self.put(('2026-10-19T08:00:00+00:00', 'a', 'merged', None),
++                 ('2026-10-19T09:00:00+00:00', 'a', 'note', {'kind': 'other'}),
++                 ('2026-10-19T09:00:00+00:00', 'a', 'note', None),
++                 ('2026-10-19T09:00:00+00:00', 'a', 'closed', DEFECT))
++        self.assertEqual(defects.from_events(self.root), [])
++
++    def test_since_excludes_earlier_days(self):
++        self.put(('2026-10-10T08:00:00+00:00', 'a', 'merged', None),
++                 ('2026-10-11T09:00:00+00:00', 'a', 'note', DEFECT),
++                 ('2026-10-19T09:00:00+00:00', 'a', 'note', DEFECT))
++        self.assertEqual(defects.from_events(self.root, since=datetime.date(2026, 10, 12)),
++                         [datetime.date(2026, 10, 19)])
++
++    def test_two_defects_the_same_day_count_twice(self):
++        self.put(('2026-10-19T08:00:00+00:00', 'a', 'merged', None),
++                 ('2026-10-19T09:00:00+00:00', 'a', 'note', DEFECT),
++                 ('2026-10-19T11:00:00+00:00', 'a', 'note', DEFECT))
++        self.assertEqual(len(defects.from_events(self.root)), 2)
++
++    def test_missing_or_damaged_journal_gives_empty_list(self):
++        self.assertEqual(defects.from_events(self.root), [])
++        self.put(('2026-10-19T08:00:00+00:00', 'a', 'merged', None))
++        with self.path.open('a', encoding='utf-8') as stream:
++            stream.write('{broken\n')
++        self.assertEqual(defects.from_events(self.root), [])
++
++    def test_log_line_takes_date_of_nearest_dated_heading_above(self):
++        self.log('# Journal\n\n## [2026-10-19] feat | quota\n\n- a\n' + MARKER_LINE + '\n\n'
++                 '## 2026-10-20 fix | suite\n' + MARKER_LINE + '\n')
++        self.assertEqual(defects.from_log(self.root),
++                         [datetime.date(2026, 10, 19), datetime.date(2026, 10, 20)])
++
++    def test_log_heading_without_date_is_skipped_for_the_date(self):
++        self.log('## [2026-10-14] feat | début\n\n## Sans date\n' + MARKER_LINE + '\n')
++        self.assertEqual(defects.from_log(self.root), [datetime.date(2026, 10, 14)])
++
++    def test_log_line_without_dated_heading_is_ignored(self):
++        self.log('texte libre\n' + MARKER_LINE + '\n## Titre sans date\n' + MARKER_LINE + '\n')
++        self.assertEqual(defects.from_log(self.root), [])
++
++    def test_log_impossible_date_is_not_a_heading(self):
++        self.log('## [2026-13-45] feat | erreur\n' + MARKER_LINE + '\n')
++        self.assertEqual(defects.from_log(self.root), [])
++
++    def test_log_since_and_missing_file(self):
++        self.assertEqual(defects.from_log(self.root), [])
++        self.log('## [2026-10-10] a\n' + MARKER_LINE + '\n## [2026-10-19] b\n' + MARKER_LINE + '\n')
++        self.assertEqual(defects.from_log(self.root, since=datetime.date(2026, 10, 15)),
++                         [datetime.date(2026, 10, 19)])
++
++    def test_weekly_groups_by_iso_week_in_ascending_order(self):
++        # 2026-10-19 is a Monday of ISO week 43; 2026-10-18 is a Sunday of week 42.
++        self.put(('2026-10-19T08:00:00+00:00', 'a', 'merged', None),
++                 ('2026-10-19T09:00:00+00:00', 'a', 'note', DEFECT),
++                 ('2026-10-18T09:00:00+00:00', 'a', 'note', DEFECT))
++        self.log('## [2026-10-19] feat | quota\n' + MARKER_LINE + '\n')
++        result = defects.weekly(self.root, today=datetime.date(2026, 10, 21))
++        self.assertEqual(result, {'weeks': [
++            {'week': '2026-W43', 'events': 1, 'log': 1, 'total': 2}], 'this_week': 2})
++
++    def test_weekly_this_week_is_zero_when_no_defect_in_week(self):
++        self.log('## [2026-10-10] feat | ancien\n' + MARKER_LINE + '\n')
++        result = defects.weekly(self.root, today=datetime.date(2026, 10, 21))
++        self.assertEqual(result, {'weeks': [
++            {'week': '2026-W41', 'events': 0, 'log': 1, 'total': 1}], 'this_week': 0})
++
++    def test_weekly_empty_when_no_journal_and_no_log(self):
++        self.assertEqual(defects.weekly(self.root, today=datetime.date(2026, 10, 19)),
++                         {'weeks': [], 'this_week': 0})
++
++    def test_weekly_defaults_today_to_utc_day(self):
++        result = defects.weekly(self.root)
++        self.assertEqual(result, {'weeks': [], 'this_week': 0})
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_events.py b/tests/test_events.py
+--- a/tests/test_events.py
++++ b/tests/test_events.py
+@@ -39,7 +39,7 @@
+         self.assertEqual(events.KINDS, (
+             'prepared', 'delegate_started', 'attempt_started', 'attempt_finished', 'verify',
+             'acceptance', 'outcome', 'merged', 'closed', 'quota', 'orchestrator_claimed', 'orchestrator_released',
+-            'selfcheck', 'subagent_started', 'subagent_finished', 'question_answered'))
++            'selfcheck', 'subagent_started', 'subagent_finished', 'question_answered', 'note'))
+ 
+     def test_record_appends_sorted_json_lines_in_utc(self):
+         events.record(self.root, 'demo', 'attempt_started', {'z': 1, 'attempt': 1, 'text': 'é'})
+diff --git a/tests/test_note.py b/tests/test_note.py
+--- a/tests/test_note.py
++++ b/tests/test_note.py
+@@ -5,6 +5,7 @@
+ import re
+ import shutil
+ import subprocess
++import sys
+ import tempfile
+ import unittest
+ 
+@@ -145,6 +146,56 @@
+         self.refused(64, 'end', task_id, '--outcome', 'fin\nprevue')
+         self.assertEqual(len(self.rows()), 1)
+ 
++    def merged(self, task_id, at='2026-10-19T08:00:00+00:00'):
++        """Fusion verte fabriquée à la main, comme l'écrit l'orchestrateur."""
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        with self.path.open('a', encoding='utf-8') as stream:
++            stream.write(json.dumps(dict(at=at, task_id=task_id, event='merged', detail=None)) + '\n')
++
++    def test_defect_after_merge_writes_note_event_and_prints_identifier(self):
++        self.merged('t06-quota')
++        result = self.run_note('defect', 'quota recalculé à la baisse', '--task', 't06-quota')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(result.stdout, 't06-quota\n')
++        self.assertEqual(self.rows()[-1]['event'], 'note')
++        self.assertEqual(self.rows()[-1]['task_id'], 't06-quota')
++        self.assertEqual(self.rows()[-1]['detail'], {'kind': 'defect', 'label': 'quota recalculé à la baisse'})
++
++    def test_two_defects_the_same_day_are_two_rows(self):
++        self.merged('t06')
++        self.assertEqual(self.run_note('defect', 'un', '--task', 't06').returncode, 0)
++        self.assertEqual(self.run_note('defect', 'deux', '--task', 't06').returncode, 0)
++        self.assertEqual([row['event'] for row in self.rows()], ['merged', 'note', 'note'])
++
++    def test_defect_on_task_never_merged_is_refused(self):
++        stderr = self.refused(1, 'defect', 'jamais', '--task', 'jamais')
++        self.assertEqual(stderr.strip(), 'note: aucune fusion connue pour jamais')
++
++    def test_defect_with_task_identifier_outside_pattern_is_refused(self):
++        self.refused(64, 'defect', 'x', '--task', 'Bad_Id')
++        self.refused(64, 'defect', 'x', '--task', '../t06')
++        self.refused(64, 'defect', 'x', '--task', '')
++
++    def test_defect_label_rules_are_those_of_start(self):
++        self.merged('t06')
++        self.refused(64, 'defect', '', '--task', 't06')
++        self.refused(64, 'defect', 'a' * 201, '--task', 't06')
++        self.refused(64, 'defect', 'ligne\x01', '--task', 't06')
++        self.assertEqual(self.run_note('defect', 'a' * 200, '--task', 't06').returncode, 0)
++
++    def test_defect_requires_task_option(self):
++        self.refused(64, 'defect', 'sans tâche')
++
++    def test_defect_is_counted_by_defects_module(self):
++        self.merged('t06', at='2000-01-01T08:00:00+00:00')
++        self.assertEqual(self.run_note('defect', 'signalé', '--task', 't06').returncode, 0)
++        code = ('import sys; sys.path.insert(0, sys.argv[1]); import defects; from pathlib import Path; '
++                'print(len(defects.from_events(Path(sys.argv[2]))))')
++        counted = subprocess.run([sys.executable, '-I', '-c', code, str(self.root / 'scripts/lib'), str(self.root)],
++                                 capture_output=True, text=True, timeout=60)
++        self.assertEqual(counted.returncode, 0, counted.stderr)
++        self.assertEqual(counted.stdout, '1\n')
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tests/test_report.py b/tests/test_report.py
+--- a/tests/test_report.py
++++ b/tests/test_report.py
+@@ -158,3 +158,44 @@
+             self.assertEqual(table[2], '| 2026-10-02T10:00:00+00:00 | b | delegate_started | '
+                                        '{"agent":"codex","isolation":"exchange"} |')
+             self.assertEqual(report('--task', 'none'), '')
++
++    def test_defects_weekly_table_and_last_line(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            shutil.copytree(ROOT / 'template/scripts', root / 'scripts')
++            (root / '.workspace').mkdir()
++            rows = [('2026-10-19T08:00:00+00:00', 'a', 'merged', None),
++                    ('2026-10-19T09:00:00+00:00', 'a', 'note', {'kind': 'defect', 'label': 'quota'}),
++                    ('2026-10-12T09:00:00+00:00', 'a', 'note', {'kind': 'defect', 'label': 'ancien'})]
++            (root / '.workspace/events.jsonl').write_text(''.join(
++                json.dumps(dict(at=at, task_id=task, event=event, detail=detail)) + '\n'
++                for at, task, event, detail in rows), encoding='utf-8')
++            (root / 'docs').mkdir()
++            (root / 'docs/LOG.md').write_text('## [2026-10-19] feat | quota\n- [défaut après fusion] quota\n',
++                                              encoding='utf-8')
++
++            def report(*args):
++                return subprocess.check_output(['bash', str(root / 'scripts/report.sh'), '--defauts', *args], text=True)
++
++            output = report('--markdown')
++            # The 2026-10-12 note precedes the merge of task a: not counted, so no W42 row.
++            self.assertEqual(output.splitlines()[:3], [
++                '| Semaine | Journal | LOG | Total |', '| --- | --- | --- | --- |',
++                '| 2026-W43 | 1 | 1 | 2 |'])
++            self.assertRegex(output.splitlines()[-1], r'^Défauts trouvés après fusion cette semaine : \d+$')
++            filtered = report('--since', '2026-10-19', '--markdown').splitlines()
++            self.assertEqual(filtered[2], '| 2026-W43 | 1 | 1 | 2 |')
++            self.assertEqual(len(filtered), 4)
++            none = report('--since', '2026-10-20', '--markdown').splitlines()
++            self.assertEqual(none[:2], ['| Semaine | Journal | LOG | Total |', '| --- | --- | --- | --- |'])
++            self.assertEqual(len(none), 3)
++
++    def test_defects_empty_without_journal_or_log(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            shutil.copytree(ROOT / 'template/scripts', root / 'scripts')
++            output = subprocess.check_output(['bash', str(root / 'scripts/report.sh'), '--defauts', '--markdown'],
++                                             text=True)
++            self.assertEqual(output.splitlines(), [
++                '| Semaine | Journal | LOG | Total |', '| --- | --- | --- | --- |',
++                'Défauts trouvés après fusion cette semaine : 0'])

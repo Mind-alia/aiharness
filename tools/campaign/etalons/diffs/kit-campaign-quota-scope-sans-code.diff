@@ -1,0 +1,45 @@
+diff --git a/tests/test_campaign.py b/tests/test_campaign.py
+--- a/tests/test_campaign.py
++++ b/tests/test_campaign.py
+@@ -305,3 +305,41 @@
+         self.assertEqual(rows[0]['status'], 'failed')
+         self.assertNotIn('failed_work', rows[0])
+         self.assertIn('--abandoned --force', (self.project / '.workspace/calls').read_text())
++
++    def test_evaluation_score_is_kept_when_it_fails_with_quota_word(self):
++        self.config.update(arms=['codex-seul'], repetitions=2)
++        self.config['tasks'][0]['evaluation_command'] = (
++            'for i in 1 2 3 4 5 6 7 8 9 10 11; do echo "ok $i"; done; '
++            'echo "not ok 12 quota projection"; exit 1')
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 0, result.stderr)
++        rows = self.rows()
++        self.assertEqual([r['status'] for r in rows], ['completed', 'completed'])
++        self.assertEqual((rows[0]['evaluation']['exit'], rows[0]['evaluation']['passed'],
++                          rows[0]['evaluation']['total']), (1, 11, 12))
++        self.assertNotIn('error', rows[0])
++        self.assertEqual(self.git('branch', '--show-current'), 'initial')
++
++    def test_gate_quota_word_is_not_a_limit(self):
++        self.config.update(arms=['codex-seul'], repetitions=1)
++        (self.project / 'scripts/gate.sh').write_text('echo "FAIL quota"; exit 1\n')
++        self.git('add', '.')
++        self.git('commit', '-qm', 'gate quota word')
++        self.config['start_commit'] = self.git('rev-parse', 'HEAD')
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 0, result.stderr)
++        row = self.rows()[0]
++        self.assertEqual(row['status'], 'completed')
++        self.assertEqual(row['gate']['exit'], 1)
++        self.assertEqual(row['evaluation']['passed'], 3)
++
++    def test_agent_quota_text_still_stops_the_campaign(self):
++        self.config.update(arms=['systeme-claude-haiku'], repetitions=1)
++        (self.project / 'scripts/delegate.sh').write_text("echo 'usage limit reached'; exit 1\n")
++        self.git('add', '.')
++        self.git('commit', '-qm', 'delegate quota text')
++        self.config['start_commit'] = self.git('rev-parse', 'HEAD')
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 75, result.stderr)
++        self.assertEqual([r['status'] for r in self.rows()], ['quota'])
++        self.assertEqual(self.git('branch', '--show-current'), 'initial')

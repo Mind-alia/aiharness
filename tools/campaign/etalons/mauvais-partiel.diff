@@ -1,0 +1,495 @@
+diff --git a/apps/service/src/domain/usage/quota-projection.test.ts b/apps/service/src/domain/usage/quota-projection.test.ts
+new file mode 100644
+index 0000000..b0278c5
+--- /dev/null
++++ b/apps/service/src/domain/usage/quota-projection.test.ts
+@@ -0,0 +1,236 @@
++import { QuotaProjectionSchema, type QuotaProjection } from '@wsc/contracts';
++import { describe, expect, it } from 'vitest';
++import { projectQuota } from './quota-projection.js';
++
++type Observation = { at: string; percent: number; resetsAt: string };
++
++const RESET = '2026-10-18T15:00:00Z';
++const NOW = new Date('2026-10-18T12:00:00Z');
++
++function obs(time: string, percent: number, resetsAt = RESET): Observation {
++  return { at: `2026-10-18T${time}Z`, percent, resetsAt };
++}
++
++/** Every result must satisfy the contract, whatever the rule that produced it. */
++function project(observations: readonly unknown[], now = NOW): QuotaProjection {
++  const result = projectQuota(observations as readonly Observation[], now);
++  expect(QuotaProjectionSchema.safeParse(result).success).toBe(true);
++  return result;
++}
++
++function unknown(reason: string) {
++  return { status: 'unknown', reason, fiabilite: 'inconnu' };
++}
++
++const reference = [obs('11:20:00', 40), obs('11:50:00', 50)];
++const referenceResult = {
++  status: 'available',
++  exhaustedAt: '2026-10-18T14:20:00.000Z',
++  observedFrom: '2026-10-18T11:20:00.000Z',
++  observedTo: '2026-10-18T11:50:00.000Z',
++  fiabilite: 'estime',
++  resetsBeforeExhaustion: false,
++};
++
++describe('projectQuota', () => {
++  it('projects the reference example linearly', () => {
++    expect(project(reference)).toStrictEqual(referenceResult);
++  });
++
++  describe('rule 1: invalid now', () => {
++    it('answers invalid before anything else', () => {
++      const invalidNow = new Date('nope');
++      expect(project([], invalidNow)).toStrictEqual(unknown('invalid'));
++      expect(project(reference, invalidNow)).toStrictEqual(unknown('invalid'));
++    });
++  });
++
++  describe('rule 2: observation validation', () => {
++    it.each([120, -1, Number.NaN, Number.POSITIVE_INFINITY, '50'])('refuses percent %s', percent => {
++      expect(project([reference[0], { ...obs('11:50:00', 0), percent }])).toStrictEqual(unknown('invalid'));
++    });
++
++    it('accepts the percent bounds', () => {
++      expect(project([obs('11:40:00', 0), obs('11:50:00', 0)])).toStrictEqual(unknown('not_increasing'));
++      expect(project([obs('11:50:00', 100)]).status).toBe('available');
++    });
++
++    it.each(['pas une date', '2026-10-18T11:20:00', '2026-10-18', '1999-12-31T23:59:59Z', '2100-01-01T00:00:00Z', 42])(
++      'refuses date %s in at and resetsAt',
++      date => {
++        expect(project([{ ...reference[0], at: date }, reference[1]])).toStrictEqual(unknown('invalid'));
++        expect(project([{ ...reference[0], resetsAt: date }, reference[1]])).toStrictEqual(unknown('invalid'));
++      },
++    );
++
++    it('refuses unknown or missing keys and non-objects', () => {
++      const missing = { at: reference[1].at, resetsAt: reference[1].resetsAt };
++      for (const bad of [{ ...reference[1], extra: 1 }, missing, null, 'obs', [1, 2, 3]]) {
++        expect(project([reference[0], bad])).toStrictEqual(unknown('invalid'));
++      }
++    });
++
++    it('validates observations of previous windows too', () => {
++      const previous = { ...obs('10:00:00', 90, '2026-10-18T11:00:00Z'), percent: 101 };
++      expect(project([previous, ...reference])).toStrictEqual(unknown('invalid'));
++    });
++
++    it('tolerates 60 s of clock skew only', () => {
++      expect(project([obs('11:50:00', 40), obs('12:00:30', 50)]).status).toBe('available');
++      expect(project([obs('11:50:00', 40), obs('12:01:01', 50)])).toStrictEqual(unknown('invalid'));
++    });
++  });
++
++  describe('rule 3: duplicates', () => {
++    it('counts an identical duplicate once', () => {
++      expect(project([...reference, { ...reference[1] }])).toStrictEqual(referenceResult);
++      expect(project([obs('11:50:00', 50), obs('11:50:00', 50)])).toStrictEqual(unknown('insufficient_data'));
++    });
++
++    it('treats offsets of the same instant as duplicates', () => {
++      const shifted = { at: '2026-10-18T13:50:00+02:00', percent: 50, resetsAt: '2026-10-18T17:00:00+02:00' };
++      expect(project([...reference, shifted])).toStrictEqual(referenceResult);
++    });
++
++    it('refuses the same instant with a different percent or reset', () => {
++      expect(project([...reference, obs('11:50:00', 51)])).toStrictEqual(unknown('invalid'));
++      expect(project([...reference, obs('11:50:00', 50, '2026-10-18T15:00:30Z')])).toStrictEqual(unknown('invalid'));
++    });
++  });
++
++  describe('rules 4 and 11: sufficient data', () => {
++    it('needs at least two observations at least 10 minutes apart', () => {
++      expect(project([])).toStrictEqual(unknown('insufficient_data'));
++      expect(project([obs('11:50:00', 50)])).toStrictEqual(unknown('insufficient_data'));
++      expect(project([obs('11:41:00', 40), obs('11:50:00', 50)])).toStrictEqual(unknown('insufficient_data'));
++      expect(project([obs('11:40:00', 40), obs('11:50:00', 50)])).toStrictEqual({
++        ...referenceResult,
++        exhaustedAt: '2026-10-18T12:40:00.000Z',
++        observedFrom: '2026-10-18T11:40:00.000Z',
++      });
++    });
++  });
++
++  describe('rule 5: ordering and immutability', () => {
++    it('gives the same result for unsorted and frozen input without changing it', () => {
++      const frozen = Object.freeze([...reference].reverse().map(item => Object.freeze({ ...item })));
++      const copy = structuredClone(frozen);
++      expect(project(frozen)).toStrictEqual(referenceResult);
++      expect(frozen).toStrictEqual(copy);
++    });
++
++    it('gives the same result for offset inputs and writes UTC', () => {
++      const shifted = [
++        { at: '2026-10-18T13:20:00+02:00', percent: 40, resetsAt: '2026-10-18T17:00:00+02:00' },
++        { at: '2026-10-18T13:50:00.000+02:00', percent: 50, resetsAt: '2026-10-18T17:00:00+02:00' },
++      ];
++      expect(project(shifted)).toStrictEqual(referenceResult);
++    });
++  });
++
++  describe('rule 6: reset of the latest observation', () => {
++    it('refuses a reset at or before the latest observation', () => {
++      expect(project([obs('11:20:00', 40), obs('11:50:00', 50, '2026-10-18T11:50:00Z')]))
++        .toStrictEqual(unknown('reset_mismatch'));
++    });
++
++    it('accepts up to 7 days plus the tolerance', () => {
++      const far = '2026-10-25T11:51:00Z';
++      expect(project([obs('11:20:00', 40, far), obs('11:50:00', 50, far)]).status).toBe('available');
++      const tooFar = '2026-10-26T11:50:00Z';
++      expect(project([obs('11:20:00', 40, tooFar), obs('11:50:00', 50, tooFar)]))
++        .toStrictEqual(unknown('reset_mismatch'));
++    });
++  });
++
++  describe('rule 7: current window segment', () => {
++    it('ignores a previous window dated before the segment', () => {
++      expect(project([obs('10:00:00', 90, '2026-10-18T11:00:00Z'), ...reference])).toStrictEqual(referenceResult);
++    });
++
++    it('refuses interleaved windows and a reset that moves back', () => {
++      expect(project([...reference, obs('11:30:00', 10, '2026-10-18T14:00:00Z')]))
++        .toStrictEqual(unknown('reset_mismatch'));
++      expect(project([obs('11:00:00', 10, '2026-10-18T16:00:00Z'), ...reference]))
++        .toStrictEqual(unknown('reset_mismatch'));
++    });
++
++    it('keeps a 30 s reset drift in the window and splits on 2 min', () => {
++      expect(project([obs('11:20:00', 40), obs('11:50:00', 50, '2026-10-18T15:00:30Z')])).toStrictEqual(referenceResult);
++      expect(project([obs('11:20:00', 40, '2026-10-18T14:58:00Z'), obs('11:50:00', 50)]))
++        .toStrictEqual(unknown('insufficient_data'));
++    });
++  });
++
++  describe('rule 8: freshness', () => {
++    it('is stale once the reset has come', () => {
++      const reset = '2026-10-18T12:00:00Z';
++      expect(project([obs('11:20:00', 40, reset), obs('11:50:00', 50, reset)])).toStrictEqual(unknown('stale'));
++      const past = '2026-10-18T11:55:00Z';
++      expect(project([obs('11:20:00', 40, past), obs('11:50:00', 50, past)])).toStrictEqual(unknown('stale'));
++    });
++
++    it('stays fresh for exactly 30 minutes', () => {
++      expect(project(reference, new Date('2026-10-18T12:20:00Z'))).toStrictEqual(referenceResult);
++      expect(project(reference, new Date('2026-10-18T12:20:00.001Z'))).toStrictEqual(unknown('stale'));
++    });
++
++    it('is stale for an exhausted window observed an hour ago', () => {
++      expect(project([obs('11:00:00', 100)])).toStrictEqual(unknown('stale'));
++    });
++  });
++
++  describe('rules 9 and 12: increase', () => {
++    it('refuses a flat or decreasing segment', () => {
++      expect(project([obs('11:20:00', 50), obs('11:50:00', 50)])).toStrictEqual(unknown('not_increasing'));
++      expect(project([obs('11:20:00', 40), obs('11:30:00', 60), obs('11:50:00', 50)]))
++        .toStrictEqual(unknown('not_increasing'));
++    });
++  });
++
++  describe('rule 10: exhausted window', () => {
++    it('dates exhaustion at the first 100', () => {
++      expect(project([obs('11:20:00', 90), obs('11:30:00', 100), obs('11:50:00', 100)])).toStrictEqual({
++        ...referenceResult,
++        exhaustedAt: '2026-10-18T11:30:00.000Z',
++      });
++    });
++
++    it('accepts a single observation at 100', () => {
++      const instant = '2026-10-18T11:50:00.000Z';
++      expect(project([obs('11:50:00', 100)])).toStrictEqual({
++        ...referenceResult,
++        exhaustedAt: instant,
++        observedFrom: instant,
++        observedTo: instant,
++      });
++    });
++  });
++
++  describe('rules 13 and 14: projection', () => {
++    it('refuses a rise too small to be represented', () => {
++      expect(project([obs('11:40:00', 50), obs('11:50:00', 50 + 1e-12)])).toStrictEqual(unknown('not_increasing'));
++      expect(project([obs('11:20:00', 50), obs('11:50:00', 50 + 1e-7)])).toStrictEqual(unknown('not_increasing'));
++    });
++
++    it('projects a slow rise far beyond the reset', () => {
++      const result = project([obs('11:20:00', 50), obs('11:50:00', 50.001)]);
++      expect(result).toMatchObject({ status: 'available', resetsBeforeExhaustion: true });
++      expect(result.status === 'available' && Date.parse(result.exhaustedAt)).toBeGreaterThan(Date.parse('2029-01-01T00:00:00Z'));
++    });
++
++    it('rounds up to the millisecond', () => {
++      const result = project([obs('11:20:00', 40), obs('11:50:00', 43)]);
++      // 57 points at 3 points per 1 800 000 ms: 34 200 000 ms after 11:50, exactly.
++      expect(result).toMatchObject({ exhaustedAt: '2026-10-18T21:20:00.000Z', resetsBeforeExhaustion: true });
++      const uneven = project([obs('11:20:00', 40), obs('11:50:00', 47)]);
++      // 53 × 1 800 000 / 7 = 13 628 571.43 ms, rounded up to 13 628 572 ms.
++      expect(uneven).toMatchObject({ exhaustedAt: '2026-10-18T15:37:08.572Z', resetsBeforeExhaustion: true });
++    });
++
++    it('does not count a projection on the reset as resetting before', () => {
++      const reset = '2026-10-18T14:20:00Z';
++      expect(project([obs('11:20:00', 40, reset), obs('11:50:00', 50, reset)])).toStrictEqual(referenceResult);
++    });
++  });
++});
+diff --git a/apps/service/src/domain/usage/quota-projection.ts b/apps/service/src/domain/usage/quota-projection.ts
+new file mode 100644
+index 0000000..185e2c9
+--- /dev/null
++++ b/apps/service/src/domain/usage/quota-projection.ts
+@@ -0,0 +1,125 @@
++import type { QuotaProjection } from '@wsc/contracts';
++
++type UnknownReason = Extract<QuotaProjection, { status: 'unknown' }>['reason'];
++
++export interface QuotaObservation {
++  readonly at: string;
++  readonly percent: number;
++  readonly resetsAt: string;
++}
++
++interface Point {
++  readonly atMs: number;
++  readonly percent: number;
++  readonly resetsMs: number;
++}
++
++export const RESET_TOLERANCE_MS = 60_000;
++export const CLOCK_SKEW_MS = 60_000;
++export const MAX_WINDOW_MS = 7 * 24 * 60 * 60_000;
++export const STALE_AFTER_MS = 30 * 60_000;
++export const MIN_SPAN_MS = 10 * 60_000;
++export const MIN_OBSERVATIONS = 2;
++export const MAX_DATE_MS = 8_640_000_000_000_000;
++const MIN_INPUT_MS = Date.UTC(2000, 0, 1);
++const MAX_INPUT_MS = Date.UTC(2100, 0, 1);
++/** Past year 9999, `toISOString()` writes six-digit years that the contract's datetime refuses. */
++const MAX_ISO_MS = Date.UTC(10_000, 0, 1);
++const OBSERVATION_KEYS = ['at', 'percent', 'resetsAt'];
++const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
++
++function unknown(reason: UnknownReason): QuotaProjection {
++  return { status: 'unknown', reason, fiabilite: 'inconnu' };
++}
++
++function available(exhaustedMs: number, first: Point, latest: Point, resetsBeforeExhaustion: boolean): QuotaProjection {
++  return {
++    status: 'available',
++    exhaustedAt: new Date(exhaustedMs).toISOString(),
++    observedFrom: new Date(first.atMs).toISOString(),
++    observedTo: new Date(latest.atMs).toISOString(),
++    fiabilite: 'estime',
++    resetsBeforeExhaustion,
++  };
++}
++
++function parseInstant(value: unknown): number | null {
++  if (typeof value !== 'string' || !ISO_DATETIME.test(value)) return null;
++  const ms = Date.parse(value);
++  return Number.isFinite(ms) && ms >= MIN_INPUT_MS && ms < MAX_INPUT_MS ? ms : null;
++}
++
++/** Rule 2: an observation either passes every check or invalidates the whole list. */
++function toPoint(value: unknown, nowMs: number): Point | null {
++  if (typeof value !== 'object' || value === null) return null;
++  const keys = Object.keys(value);
++  if (keys.length !== OBSERVATION_KEYS.length || !OBSERVATION_KEYS.every(key => keys.includes(key))) return null;
++  const { at, percent, resetsAt } = value as Record<string, unknown>;
++  const atMs = parseInstant(at);
++  const resetsMs = parseInstant(resetsAt);
++  if (atMs === null || resetsMs === null || atMs > nowMs + CLOCK_SKEW_MS) return null;
++  if (typeof percent !== 'number' || !Number.isFinite(percent) || percent < 0 || percent > 100) return null;
++  return { atMs, percent, resetsMs };
++}
++
++/** Rule 3: identical duplicates count once; a conflicting duplicate returns null. */
++function dedupe(points: readonly Point[]): Point[] | null {
++  const byInstant = new Map<number, Point>();
++  for (const point of points) {
++    const seen = byInstant.get(point.atMs);
++    if (seen === undefined) byInstant.set(point.atMs, point);
++    else if (seen.percent !== point.percent || seen.resetsMs !== point.resetsMs) return null;
++  }
++  return [...byInstant.values()];
++}
++
++/** Rule 7: observations of the current window, or null when windows interleave or the reset moves back. */
++function currentSegment(sorted: readonly Point[], latest: Point): readonly Point[] | null {
++  const inWindow = (point: Point) => Math.abs(point.resetsMs - latest.resetsMs) <= RESET_TOLERANCE_MS;
++  const segment = sorted.filter(inWindow);
++  const firstMs = (segment[0] ?? latest).atMs;
++  const conflicting = sorted.some(point => !inWindow(point)
++    && (point.atMs > firstMs || point.resetsMs > latest.resetsMs + RESET_TOLERANCE_MS));
++  return conflicting ? null : segment;
++}
++
++/** Rules 9 to 14 on a fresh, coherent segment whose last point is `latest`. */
++function projectSegment(segment: readonly Point[], latest: Point): QuotaProjection {
++  if (segment.some((point, index) => index > 0 && point.percent < (segment[index - 1] ?? point).percent)) {
++    return unknown('not_increasing');
++  }
++  const first = segment[0] ?? latest;
++  if (latest.percent === 100) {
++    const exhausted = segment.find(point => point.percent === 100) ?? latest;
++    return available(exhausted.atMs, first, latest, false);
++  }
++  if (segment.length < MIN_OBSERVATIONS || latest.atMs - first.atMs < MIN_SPAN_MS) return unknown('insufficient_data');
++  const delta = latest.percent - first.percent;
++  if (delta === 0) return unknown('not_increasing');
++  const exhaustedMs = Math.ceil(latest.atMs + ((100 - latest.percent) * (latest.atMs - first.atMs)) / delta);
++  if (!Number.isFinite(exhaustedMs) || exhaustedMs > MAX_DATE_MS || exhaustedMs >= MAX_ISO_MS) {
++    return unknown('not_increasing');
++  }
++  return available(exhaustedMs, first, latest, false);
++}
++
++/** Pure linear projection of one quota window; rules apply in order and the first match wins. */
++export function projectQuota(observations: readonly QuotaObservation[], now: Date): QuotaProjection {
++  const nowMs = now.getTime();
++  if (Number.isNaN(nowMs)) return unknown('invalid');
++  const points = observations.map(observation => toPoint(observation, nowMs));
++  const valid = points.filter((point): point is Point => point !== null);
++  if (valid.length !== points.length) return unknown('invalid');
++  const unique = dedupe(valid);
++  if (unique === null) return unknown('invalid');
++  const sorted = unique.toSorted((a, b) => a.atMs - b.atMs);
++  const latest = sorted.at(-1);
++  if (latest === undefined) return unknown('insufficient_data');
++  if (latest.resetsMs <= latest.atMs || latest.resetsMs - latest.atMs > MAX_WINDOW_MS + RESET_TOLERANCE_MS) {
++    return unknown('reset_mismatch');
++  }
++  const segment = currentSegment(sorted, latest);
++  if (segment === null) return unknown('reset_mismatch');
++  if (latest.resetsMs <= nowMs || nowMs - latest.atMs > STALE_AFTER_MS) return unknown('stale');
++  return projectSegment(segment, latest);
++}
+diff --git a/packages/contracts/src/usage.test.ts b/packages/contracts/src/usage.test.ts
+new file mode 100644
+index 0000000..d2d3439
+--- /dev/null
++++ b/packages/contracts/src/usage.test.ts
+@@ -0,0 +1,77 @@
++import { describe, expect, it } from 'vitest';
++import { QuotaProjectionSchema, UsageWindowSchema } from './usage.js';
++
++const available = {
++  status: 'available',
++  exhaustedAt: '2026-10-18T14:20:00.000Z',
++  observedFrom: '2026-10-18T11:20:00.000Z',
++  observedTo: '2026-10-18T11:50:00.000Z',
++  fiabilite: 'estime',
++  resetsBeforeExhaustion: false,
++} as const;
++const unknown = { status: 'unknown', reason: 'stale', fiabilite: 'inconnu' } as const;
++const window = {
++  id: 'five_hour',
++  percent: 50,
++  resetsAt: '2026-10-18T15:00:00Z',
++  fiabilite: 'mesure',
++  observedAt: '2026-10-18T11:50:00Z',
++} as const;
++
++describe('QuotaProjectionSchema', () => {
++  it('accepts both variants', () => {
++    expect(QuotaProjectionSchema.parse(available)).toEqual(available);
++    for (const reason of ['insufficient_data', 'stale', 'not_increasing', 'reset_mismatch', 'invalid']) {
++      expect(QuotaProjectionSchema.safeParse({ ...unknown, reason }).success).toBe(true);
++    }
++  });
++
++  it('accepts fractional seconds and equal bounds', () => {
++    const instant = '2026-10-18T11:20:00.123456Z';
++    const projection = { ...available, exhaustedAt: instant, observedFrom: instant, observedTo: instant };
++    expect(QuotaProjectionSchema.safeParse(projection).success).toBe(true);
++  });
++
++  it('refuses unknown fields on both variants', () => {
++    expect(QuotaProjectionSchema.safeParse({ ...available, extra: 1 }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, extra: 1 }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, exhaustedAt: available.exhaustedAt }).success).toBe(false);
++  });
++
++  it('refuses missing fields, foreign reliabilities, statuses and reasons', () => {
++    const withoutFlag = Object.fromEntries(Object.entries(available).filter(([key]) => key !== 'resetsBeforeExhaustion'));
++    expect(QuotaProjectionSchema.safeParse(withoutFlag).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ status: 'unknown', fiabilite: 'inconnu' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, fiabilite: 'inconnu' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, fiabilite: 'mesure' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, fiabilite: 'estime' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, reason: 'other' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, status: 'pending' }).success).toBe(false);
++  });
++
++  it('refuses dates without a UTC suffix', () => {
++    for (const exhaustedAt of ['2026-10-18T14:20:00', '2026-10-18T16:20:00+02:00', '2026-10-18', 'demain']) {
++      expect(QuotaProjectionSchema.safeParse({ ...available, exhaustedAt }).success).toBe(false);
++    }
++  });
++
++  it('refuses incoherent dates', () => {
++    expect(QuotaProjectionSchema.safeParse({ ...available, observedFrom: '2026-10-18T11:51:00.000Z' }).success)
++      .toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, exhaustedAt: '2026-10-18T11:19:59.999Z' }).success)
++      .toBe(false);
++  });
++});
++
++describe('UsageWindowSchema projection', () => {
++  it('accepts a window without projection or with either variant', () => {
++    expect(UsageWindowSchema.safeParse(window).success).toBe(true);
++    expect(UsageWindowSchema.parse({ ...window, projection: available }).projection).toEqual(available);
++    expect(UsageWindowSchema.parse({ ...window, projection: unknown }).projection).toEqual(unknown);
++  });
++
++  it('refuses a null or invalid projection', () => {
++    expect(UsageWindowSchema.safeParse({ ...window, projection: null }).success).toBe(false);
++    expect(UsageWindowSchema.safeParse({ ...window, projection: { ...unknown, reason: 'other' } }).success).toBe(false);
++  });
++});
+diff --git a/packages/contracts/src/usage.ts b/packages/contracts/src/usage.ts
+index 42cfb42..179827f 100644
+--- a/packages/contracts/src/usage.ts
++++ b/packages/contracts/src/usage.ts
+@@ -4,6 +4,26 @@ import { FiabiliteSchema, ProviderIdSchema } from './activity-event.js';
+ export const UsageWindowIdSchema = z.enum(['five_hour', 'seven_day']);
+ export type UsageWindowId = z.infer<typeof UsageWindowIdSchema>;
+ 
++/** Linear estimate of when a window reaches 100 %, or an explicit unknown with its reason. */
++export const QuotaProjectionSchema = z.discriminatedUnion('status', [
++  z.strictObject({
++    status: z.literal('available'),
++    exhaustedAt: z.iso.datetime(),
++    observedFrom: z.iso.datetime(),
++    observedTo: z.iso.datetime(),
++    fiabilite: z.literal('estime'),
++    resetsBeforeExhaustion: z.boolean(),
++  })
++    .refine(p => Date.parse(p.observedFrom) <= Date.parse(p.observedTo), { path: ['observedTo'] })
++    .refine(p => Date.parse(p.exhaustedAt) >= Date.parse(p.observedFrom), { path: ['exhaustedAt'] }),
++  z.strictObject({
++    status: z.literal('unknown'),
++    reason: z.enum(['insufficient_data', 'stale', 'not_increasing', 'reset_mismatch', 'invalid']),
++    fiabilite: z.literal('inconnu'),
++  }),
++]);
++export type QuotaProjection = z.infer<typeof QuotaProjectionSchema>;
++
+ export const UsageWindowSchema = z.strictObject({
+   id: UsageWindowIdSchema,
+   percent: z.number().nullable(),
+@@ -12,6 +32,7 @@ export const UsageWindowSchema = z.strictObject({
+   observedAt: z.iso.datetime().nullable(),
+   /** True when `observedAt` is only bounded by the source file (the event carried no timestamp). */
+   observedAtApprox: z.boolean().optional(),
++  projection: QuotaProjectionSchema.optional(),
+ });
+ export type UsageWindow = z.infer<typeof UsageWindowSchema>;
+ 

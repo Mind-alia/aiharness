@@ -1,0 +1,93 @@
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -79,7 +79,8 @@
+         done = run(self.root, self.env, 'claim', '--session', 'nuit', '--model', 'opus', '--pid', str(os.getpid()))
+         self.assertEqual(done.returncode, 0, done.stderr)
+         data = json.loads(self.lock.read_text(encoding='utf-8'))
+-        self.assertEqual(sorted(data), ['model', 'pid', 'repos', 'session', 'started_at'])
++        self.assertEqual(sorted(data), ['launched_by', 'model', 'pid', 'repos', 'session', 'started_at'])
++        self.assertIsNone(data['launched_by'])
+         self.assertEqual((data['session'], data['model'], data['pid']), ('nuit', 'opus', os.getpid()))
+         self.assertEqual(data['repos'], [str(self.root)])
+         self.assertRegex(data['started_at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+@@ -106,8 +107,10 @@
+         self.assertEqual(self.status_lines()[0], 'verrou : aucun')
+ 
+         self.assertEqual([(item['task_id'], item['event'], item['detail']) for item in self.events()], [
+-            ('orchestrator', 'orchestrator_claimed', {'session': 'nuit', 'model': 'opus', 'pid': os.getpid()}),
+-            ('orchestrator', 'orchestrator_claimed', {'session': 'jour', 'model': 'inconnu', 'pid': data['pid']}),
++            ('orchestrator', 'orchestrator_claimed',
++             {'session': 'nuit', 'model': 'opus', 'pid': os.getpid(), 'launched_by': None}),
++            ('orchestrator', 'orchestrator_claimed',
++             {'session': 'jour', 'model': 'inconnu', 'pid': data['pid'], 'launched_by': None}),
+             ('orchestrator', 'orchestrator_released', {'session': 'jour'})])
+ 
+     def test_claim_defaults_and_file_mode(self):
+@@ -120,6 +123,42 @@
+         self.assertEqual(stat.S_IMODE(self.lock.stat().st_mode), 0o600)
+         self.assertEqual(stat.S_IMODE(self.lock.parent.stat().st_mode), 0o700)
+         self.assertEqual([path.name for path in self.lock.parent.iterdir() if path.name.endswith('.tmp')], [])
++
++    def test_claim_by_records_the_launcher_in_lock_journal_and_status(self):
++        done = run(self.root, self.env, 'claim', '--session', 'nuit', '--model', 'opus', '--by', 'owner',
++                   '--pid', str(os.getpid()))
++        self.assertEqual(done.returncode, 0, done.stderr)
++        data = json.loads(self.lock.read_text(encoding='utf-8'))
++        self.assertEqual(data['launched_by'], 'owner')
++        self.assertEqual((data['session'], data['model'], data['pid']), ('nuit', 'opus', os.getpid()))
++        self.assertEqual(self.events()[0]['detail'], {'session': 'nuit', 'model': 'opus', 'pid': os.getpid(),
++                                                      'launched_by': 'owner'})
++        self.assertEqual(self.status_lines()[0], 'verrou : nuit (opus) depuis %s, pid %d (vivant), lancé par owner'
++                         % (data['started_at'], os.getpid()))
++
++    def test_claim_without_by_records_a_null_launcher(self):
++        done = run(self.root, self.env, 'claim', '--session', 's', '--pid', str(os.getpid()))
++        self.assertEqual(done.returncode, 0, done.stderr)
++        self.assertIsNone(json.loads(self.lock.read_text(encoding='utf-8'))['launched_by'])
++        self.assertIsNone(self.events()[0]['detail']['launched_by'])
++        self.assertNotIn('lancé par', self.status_lines()[0])
++
++    def test_claim_refuses_an_invalid_launcher_without_writing_the_lock(self):
++        for value in ('', 'a\nb', 'tab\there', 'cloche\x07', 'x' * 65):
++            done = run(self.root, self.env, 'claim', '--by', value, '--pid', str(os.getpid()))
++            self.assertEqual(done.returncode, 64, repr(value))
++            self.assertIn('--by', done.stderr)
++            self.assertFalse(self.lock.exists(), repr(value))
++        self.assertEqual(self.events(), [])
++        done = run(self.root, self.env, 'claim', '--session', 'nuit', '--pid', str(os.getpid()))
++        self.assertEqual(done.returncode, 0, done.stderr)
++        before = self.lock.read_text(encoding='utf-8')
++        refused = run(self.root, self.env, 'claim', '--force', '--by', '', '--pid', str(os.getpid()))
++        self.assertEqual(refused.returncode, 64)
++        self.assertEqual(self.lock.read_text(encoding='utf-8'), before)
++        accepted = run(self.root, self.env, 'claim', '--force', '--by', 'x' * 64, '--pid', str(os.getpid()))
++        self.assertEqual(accepted.returncode, 0, accepted.stderr)
++        self.assertEqual(json.loads(self.lock.read_text(encoding='utf-8'))['launched_by'], 'x' * 64)
+ 
+     def test_release_without_lock_is_silent_for_the_journal(self):
+         done = run(self.root, self.env, 'release')
+@@ -153,6 +192,23 @@
+         self.lock.write_text('pas du json')
+         self.assertEqual(self.status_lines()[0], 'verrou : illisible')
+ 
++    def test_status_shows_launcher_only_for_a_non_empty_string(self):
++        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
++        dead.wait()
++        run(self.root, self.env, 'claim', '--session', 's', '--by', 'Fable', '--pid', str(dead.pid))
++        self.assertTrue(self.status_lines()[0].endswith('(terminé), lancé par Fable'), self.status_lines()[0])
++        legacy = {'session': 'ancien', 'model': 'opus', 'started_at': '2026-10-01T00:00:00Z', 'pid': dead.pid,
++                  'repos': []}
++        for extra in ({}, {'launched_by': None}, {'launched_by': ''}, {'launched_by': 3}):
++            self.lock.write_text(json.dumps(dict(legacy, **extra)))
++            self.assertEqual(self.status_lines()[0], 'verrou : ancien (opus) depuis 2026-10-01T00:00:00Z, pid %d '
++                             '(terminé)' % dead.pid, extra)
++
++    def test_usage_names_the_launcher_option(self):
++        done = run(self.root, self.env)
++        self.assertEqual(done.returncode, 64)
++        self.assertIn('[--by NOM]', done.stderr)
++
+     def test_status_lists_active_tasks_and_tolerates_unreadable_state(self):
+         tasks = self.root / '.workspace/orchestration/tasks'
+         for name, content in [('a-run', '{"status": "running"}'), ('b-done', '{"status": "merged"}'),

@@ -1,0 +1,301 @@
+diff --git a/template/scripts/lib/note.py b/template/scripts/lib/note.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/note.py
+@@ -0,0 +1,124 @@
++"""Déclare un sous-agent lancé hors du circuit, par deux événements liés (Python 3.9, stdlib seule).
++
++`note.sh start <libellé>` écrit `subagent_started` et imprime un identifiant `note-…` ; `note.sh end <id>`
++écrit `subagent_finished` pour ce même identifiant, avec la durée. Le hub des usines lit ces événements dans
++`.workspace/events.jsonl` : sans eux, un sous-agent lancé à la main reste invisible.
++
++Règle : tout sous-agent lancé hors du circuit est encadré par `note.sh start` / `end`.
++"""
++import argparse
++import datetime
++import os
++from pathlib import Path
++import sys
++
++import events
++
++sys.dont_write_bytecode = True
++
++KINDS = ('subagent', 'check', 'step')
++DEFAULT_KIND = 'subagent'
++DEFAULT_OUTCOME = 'done'
++LABEL_MAX = 200
++VALUE_MAX = 64
++USAGE_ERROR = 64
++STATE_ERROR = 1
++RANDOM_BYTES = 3
++ID_PREFIX = 'note-'
++CONTROL_LIMIT = 32
++DELETE_CHAR = 127
++
++
++def fail(code, message):
++    """Message d'une ligne sur stderr, puis sortie avec le code donné."""
++    print('note: ' + message.replace('\n', ' '), file=sys.stderr)
++    sys.exit(code)
++
++
++class _Parser(argparse.ArgumentParser):
++    """Erreurs d'usage refusées avec le code 64 et un message d'une ligne."""
++
++    def error(self, message):
++        fail(USAGE_ERROR, message)
++
++
++def _check_control(name, value):
++    if any(ord(char) < CONTROL_LIMIT or ord(char) == DELETE_CHAR for char in value):
++        fail(USAGE_ERROR, name + ' contient un caractère de contrôle')
++
++
++def _check_value(name, value, limit):
++    if not value:
++        fail(USAGE_ERROR, name + ' vide')
++    if len(value) > limit:
++        fail(USAGE_ERROR, '%s de plus de %d caractères' % (name, limit))
++    _check_control(name, value)
++
++
++def new_id(now):
++    """Identifiant `note-<AAAAMMJJTHHMMSSZ>-<6 hexadécimaux>` ; `os.urandom` car `secrets` est masqué par le kit."""
++    return ID_PREFIX + now.strftime('%Y%m%dT%H%M%SZ') + '-' + os.urandom(RANDOM_BYTES).hex()
++
++
++def start(root, label, model, kind):
++    _check_value('libellé', label, LABEL_MAX)
++    if model is not None:
++        _check_value('--model', model, VALUE_MAX)
++    task_id = new_id(datetime.datetime.now(datetime.timezone.utc))
++    detail = {'label': label, 'model': model, 'kind': kind}
++    events.record(root, task_id, 'subagent_started', detail)
++    print(task_id)
++    return 0
++
++
++def _find(rows, event):
++    for row in rows:
++        if row['event'] == event:
++            return row
++    return None
++
++
++def end(root, task_id, outcome):
++    _check_control('identifiant', task_id)
++    _check_value('--outcome', outcome, VALUE_MAX)
++    rows = events.read(root, task_id=task_id)
++    started = _find(rows, 'subagent_started')
++    if started is None:
++        fail(STATE_ERROR, 'identifiant inconnu : ' + task_id)
++    if _find(rows, 'subagent_finished') is not None:
++        fail(STATE_ERROR, 'déjà terminé : ' + task_id)
++    started_at = datetime.datetime.fromisoformat(started['at'])
++    now = datetime.datetime.now(datetime.timezone.utc)
++    origin = started['detail']
++    detail = {'label': origin['label'], 'model': origin['model'], 'kind': origin['kind'],
++              'outcome': outcome, 'seconds': max(0, int((now - started_at).total_seconds()))}
++    events.record(root, task_id, 'subagent_finished', detail)
++    return 0
++
++
++def build_parser():
++    parser = _Parser(prog='note.sh')
++    commands = parser.add_subparsers(dest='command', metavar='start|end')
++    commands.required = True
++    begin = commands.add_parser('start')
++    begin.add_argument('label')
++    begin.add_argument('--model')
++    begin.add_argument('--kind', choices=KINDS, default=DEFAULT_KIND)
++    finish = commands.add_parser('end')
++    finish.add_argument('task_id')
++    finish.add_argument('--outcome', default=DEFAULT_OUTCOME)
++    return parser
++
++
++def main(argv):
++    if len(argv) < 2:
++        fail(USAGE_ERROR, 'usage : note.sh start <libellé> | end <id>')
++    root = Path(argv[0])
++    args = build_parser().parse_args(argv[1:])
++    if args.command == 'start':
++        return start(root, args.label, args.model, args.kind)
++    return end(root, args.task_id, args.outcome)
++
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv[1:]))
+diff --git a/template/scripts/note.sh b/template/scripts/note.sh
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/note.sh
+@@ -0,0 +1,6 @@
++#!/bin/sh
++umask 077
++set -eu
++SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++root=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
++exec python3 "$SCRIPT_DIR/lib/note.py" "$root" "$@"
+diff --git a/tests/test_note.py b/tests/test_note.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_note.py
+@@ -0,0 +1,150 @@
++"""Tests de template/scripts/note.sh : le vrai script, lancé dans un projet temporaire (aucun réseau)."""
++import datetime
++import json
++from pathlib import Path
++import re
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++TEMPLATE = Path(__file__).resolve().parents[1] / 'template/scripts'
++ID_PATTERN = re.compile(r'^note-\d{8}T\d{6}Z-[0-9a-f]{6}$')
++IGNORED = shutil.ignore_patterns('__tests__', '__pycache__')
++
++
++class NoteTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name).resolve()
++        shutil.copytree(TEMPLATE, self.root / 'scripts', ignore=IGNORED)
++        self.script = self.root / 'scripts/note.sh'
++        self.path = self.root / '.workspace/events.jsonl'
++
++    def run_note(self, *args):
++        return subprocess.run(['sh', str(self.script), *args], capture_output=True, text=True, timeout=60)
++
++    def start(self, *args):
++        result = self.run_note('start', *args)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        return result.stdout.strip()
++
++    def rows(self):
++        if not self.path.exists():
++            return []
++        return [json.loads(line) for line in self.path.read_text(encoding='utf-8').splitlines()]
++
++    def refused(self, code, *args):
++        before = self.rows()
++        result = self.run_note(*args)
++        self.assertEqual(result.returncode, code, result.stderr)
++        self.assertEqual(result.stdout, '')
++        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
++        self.assertEqual(self.rows(), before)
++        return result.stderr
++
++    def age(self, task_id, seconds):
++        """Recule l'instant de départ de `seconds` pour mesurer une durée sans attendre."""
++        rows = self.rows()
++        past = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds)
++        for row in rows:
++            if row['task_id'] == task_id:
++                row['at'] = past.isoformat()
++        self.path.write_text(''.join(json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n' for row in rows),
++                             encoding='utf-8')
++
++    def test_start_prints_identifier_and_writes_started_event(self):
++        task_id = self.start('Relecture du module', '--model', 'haiku', '--kind', 'check')
++        self.assertRegex(task_id, ID_PATTERN)
++        self.assertEqual(self.rows()[0]['task_id'], task_id)
++        self.assertEqual(self.rows()[0]['event'], 'subagent_started')
++        self.assertEqual(self.rows()[0]['detail'], {'label': 'Relecture du module', 'model': 'haiku', 'kind': 'check'})
++
++    def test_start_defaults_model_to_null_and_kind_to_subagent(self):
++        task_id = self.start('exploration')
++        self.assertEqual(self.rows()[0]['detail'], {'label': 'exploration', 'model': None, 'kind': 'subagent'})
++        self.assertEqual(self.rows()[0]['task_id'], task_id)
++
++    def test_two_starts_give_two_identifiers(self):
++        first = self.start('a')
++        second = self.start('b')
++        self.assertNotEqual(first, second)
++
++    def test_label_keeps_accents_and_spaces(self):
++        self.start('Vérification des accents, à la main')
++        self.assertEqual(self.rows()[0]['detail']['label'], 'Vérification des accents, à la main')
++
++    def test_end_writes_finished_event_with_copied_detail_and_duration(self):
++        task_id = self.start('exploration', '--model', 'opus', '--kind', 'step')
++        self.age(task_id, 125)
++        result = self.run_note('end', task_id)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(result.stdout, '')
++        finished = self.rows()[1]
++        self.assertEqual(finished['event'], 'subagent_finished')
++        self.assertEqual(finished['task_id'], task_id)
++        self.assertEqual(finished['detail']['label'], 'exploration')
++        self.assertEqual(finished['detail']['model'], 'opus')
++        self.assertEqual(finished['detail']['kind'], 'step')
++        self.assertEqual(finished['detail']['outcome'], 'done')
++        self.assertIsInstance(finished['detail']['seconds'], int)
++        self.assertGreaterEqual(finished['detail']['seconds'], 125)
++        self.assertLess(finished['detail']['seconds'], 135)
++
++    def test_end_takes_outcome(self):
++        task_id = self.start('relecture')
++        self.assertEqual(self.run_note('end', task_id, '--outcome', 'blocked').returncode, 0)
++        self.assertEqual(self.rows()[1]['detail']['outcome'], 'blocked')
++
++    def test_started_precedes_finished_in_journal(self):
++        task_id = self.start('ordre')
++        self.run_note('end', task_id)
++        self.assertEqual([row['event'] for row in self.rows()], ['subagent_started', 'subagent_finished'])
++        self.assertEqual({row['task_id'] for row in self.rows()}, {task_id})
++
++    def test_end_unknown_identifier_is_refused(self):
++        stderr = self.refused(1, 'end', 'note-20261019T013502Z-a1b2c3')
++        self.assertIn('identifiant inconnu', stderr)
++
++    def test_end_twice_is_refused(self):
++        task_id = self.start('une fois')
++        self.assertEqual(self.run_note('end', task_id).returncode, 0)
++        stderr = self.refused(1, 'end', task_id)
++        self.assertIn('déjà terminé', stderr)
++
++    def test_unknown_or_missing_subcommand_is_refused(self):
++        self.refused(64, 'stop', 'x')
++        self.refused(64)
++
++    def test_missing_argument_is_refused(self):
++        self.refused(64, 'start')
++        self.refused(64, 'end')
++
++    def test_kind_outside_list_is_refused(self):
++        self.refused(64, 'start', 'x', '--kind', 'robot')
++
++    def test_empty_label_is_refused(self):
++        self.refused(64, 'start', '')
++
++    def test_label_length_limit(self):
++        self.start('a' * 200)
++        self.refused(64, 'start', 'a' * 201)
++
++    def test_model_and_outcome_are_bounded(self):
++        self.refused(64, 'start', 'x', '--model', '')
++        self.refused(64, 'start', 'x', '--model', 'm' * 65)
++        task_id = self.start('x', '--model', 'm' * 64)
++        self.refused(64, 'end', task_id, '--outcome', '')
++        self.refused(64, 'end', task_id, '--outcome', 'o' * 65)
++
++    def test_control_characters_are_refused(self):
++        self.refused(64, 'start', 'ligne\x01')
++        self.refused(64, 'start', 'x', '--model', 'mod\x7fele')
++        task_id = self.start('x')
++        self.refused(64, 'end', task_id, '--outcome', 'fin\nprevue')
++        self.assertEqual(len(self.rows()), 1)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

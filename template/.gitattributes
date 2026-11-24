@@ -1,0 +1,5 @@
+# Line endings: shell scripts and kit sources stay LF on every platform (WSL cannot run CRLF scripts).
+*.sh text eol=lf
+*.py text eol=lf
+*.ts text eol=lf
+*.json text eol=lf

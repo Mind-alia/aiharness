@@ -1,0 +1,208 @@
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+LIB = ROOT / 'template/scripts/lib'
+MODULE = LIB / 'statusline.py'
+SHELL = ROOT / 'template/scripts/statusline.sh'
+sys.path.insert(0, str(LIB))
+
+import statusline  # noqa: E402
+
+SESSION = {
+    'model': {'display_name': 'Opus', 'id': 'claude-opus-5-5'},
+    'session_id': 'secret-session',
+    'transcript_path': '/private/transcript.jsonl',
+    'rate_limits': {
+        'five_hour': {'used_percentage': 23, 'resets_at': 1893459600},
+        'seven_day': {'used_percentage': 41, 'resets_at': '2030-01-02T00:00:00Z'},
+    },
+}
+STAMP = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
+
+
+class StatuslineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / 'console'
+        patch = mock.patch.dict(os.environ, {'WSC_HOME': str(self.home)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.log = self.home / statusline.FILE_NAME
+
+    def run_module(self, raw, command=None):
+        command = command or [sys.executable, str(MODULE)]
+        result = subprocess.run(command, input=raw, stdout=subprocess.PIPE, env=os.environ.copy())
+        self.assertEqual(result.returncode, 0)
+        return result.stdout.decode('utf-8')
+
+    def send(self, data):
+        raw = data if isinstance(data, bytes) else json.dumps(data).encode('utf-8')
+        return self.run_module(raw).rstrip('\n')
+
+    def records(self):
+        return [json.loads(line) for line in self.log.read_text(encoding='utf-8').splitlines()]
+
+    def test_sample_prints_line_and_logs_compact_record(self):
+        self.assertEqual(self.send(SESSION), 'Opus · 5 h : 23 % · semaine : 41 %')
+        self.assertEqual(self.log.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
+        (record,) = self.records()
+        self.assertEqual(set(record), {'timestamp', 'five_hour', 'seven_day'})
+        self.assertRegex(record['timestamp'], STAMP)
+        self.assertEqual(record['five_hour'], {'used_percentage': 23, 'resets_at': '2030-01-01T01:00:00.000Z'})
+        self.assertEqual(record['seven_day'], {'used_percentage': 41, 'resets_at': '2030-01-02T00:00:00.000Z'})
+        self.assertNotIn('secret-session', self.log.read_text(encoding='utf-8'))
+
+    def test_shell_wrapper_gives_same_output(self):
+        output = self.run_module(json.dumps(SESSION).encode('utf-8'), ['sh', str(SHELL)])
+        self.assertEqual(output.rstrip('\n'), 'Opus · 5 h : 23 % · semaine : 41 %')
+        self.assertEqual(len(self.records()), 1)
+
+    def test_invalid_input_prints_default_and_writes_nothing(self):
+        for raw in (b'', b'[1, 2]', b'{broken', b'\xff\xfe', b'{"x": "' + b'a' * 300000 + b'"}'):
+            self.assertEqual(self.run_module(raw).rstrip('\n'), 'Claude')
+        self.assertFalse(self.log.exists())
+
+    def test_missing_rate_limits_prints_label_only(self):
+        self.assertEqual(self.send({'model': {'display_name': 'Opus'}}), 'Opus')
+        self.assertEqual(self.send({'model': {'display_name': 'Opus'}, 'rate_limits': []}), 'Opus')
+        self.assertFalse(self.log.exists())
+
+    def test_label_uses_id_and_keeps_printable_ascii_only(self):
+        self.assertEqual(self.send({'model': {'display_name': 5, 'id': 'sonnet'}}), 'sonnet')
+        self.assertEqual(self.send({'model': {'display_name': 'Opusé 5'}}), 'Opus 5')
+        self.assertEqual(self.send({'model': {'display_name': 'é'}}), 'Claude')
+        self.assertEqual(self.send({'model': {'display_name': 'x' * 100}}), 'x' * 60)
+
+    def test_invalid_windows_become_null_but_record_is_written(self):
+        data = {
+            'rate_limits': {
+                'five_hour': {'used_percentage': 101, 'resets_at': 1893459600},
+                'seven_day': {'used_percentage': True, 'resets_at': 1893459600},
+            }
+        }
+        self.assertEqual(self.send(data), 'Claude')
+        (record,) = self.records()
+        self.assertIsNone(record['five_hour'])
+        self.assertIsNone(record['seven_day'])
+
+    def test_naive_date_and_boolean_reset_are_invalid(self):
+        self.assertIsNone(statusline.utc_stamp('2030-01-02T00:00:00'))
+        self.assertIsNone(statusline.utc_stamp(True))
+        self.assertIsNone(statusline.utc_stamp(0))
+        self.assertIsNone(statusline.utc_stamp(float('nan')))
+        self.assertIsNone(statusline.utc_stamp(float('inf')))
+
+    def test_offset_dates_are_normalised_to_utc(self):
+        self.assertEqual(statusline.utc_stamp('2030-01-02T01:00:00+01:00'), '2030-01-02T00:00:00.000Z')
+        self.assertEqual(statusline.utc_stamp('2030-01-02T00:00:00.250Z'), '2030-01-02T00:00:00.250Z')
+
+    def test_percentages_are_kept_and_rounded_only_in_display(self):
+        data = {
+            'model': {'display_name': 'Opus'},
+            'rate_limits': {
+                'five_hour': {'used_percentage': 41.4, 'resets_at': 1893459600},
+                'seven_day': {'used_percentage': 0, 'resets_at': 1893459600},
+            },
+        }
+        self.assertEqual(self.send(data), 'Opus · 5 h : 41 % · semaine : 0 %')
+        self.assertEqual(self.records()[0]['five_hour']['used_percentage'], 41.4)
+
+    def test_full_file_is_archived_before_append(self):
+        self.home.mkdir(mode=0o700)
+        self.log.write_bytes(b'x' * statusline.MAX_FILE_BYTES)
+        self.send(SESSION)
+        archive = self.home / (statusline.FILE_NAME + '.1')
+        self.assertEqual(archive.stat().st_size, statusline.MAX_FILE_BYTES)
+        self.assertEqual(len(self.records()), 1)
+
+    def test_symbolic_link_is_never_followed(self):
+        self.home.mkdir(mode=0o700)
+        target = Path(self.tmp.name) / 'target.txt'
+        target.write_text('intact', encoding='utf-8')
+        self.log.symlink_to(target)
+        self.assertEqual(self.send(SESSION), 'Opus · 5 h : 23 % · semaine : 41 %')
+        self.assertEqual(target.read_text(encoding='utf-8'), 'intact')
+
+    def test_directory_in_place_of_log_is_ignored(self):
+        self.log.mkdir(parents=True)
+        self.assertEqual(self.send(SESSION), 'Opus · 5 h : 23 % · semaine : 41 %')
+        self.assertTrue(self.log.is_dir())
+
+    def test_closed_stdout_exits_zero_and_still_logs(self):
+        command = ['sh', '-c', '"$0" "$1" >&-', sys.executable, str(MODULE)]
+        result = subprocess.run(command, input=json.dumps(SESSION).encode('utf-8'), stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b'')
+        self.assertEqual(len(self.records()), 1)
+
+    def test_broken_pipe_exits_zero_without_error_message(self):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(MODULE)], input=json.dumps(SESSION).encode('utf-8'), stdout=write_fd, stderr=subprocess.PIPE
+            )
+        finally:
+            os.close(write_fd)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b'')
+        self.assertEqual(len(self.records()), 1)
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = Path(self.tmp.name) / 'nested' / 'settings.json'
+        self.command = '/x/statusline.sh'
+        self.wanted = {'type': 'command', 'command': self.command}
+
+    def write(self, text):
+        self.settings.parent.mkdir(parents=True, exist_ok=True)
+        self.settings.write_text(text, encoding='utf-8')
+
+    def read(self):
+        return json.loads(self.settings.read_text(encoding='utf-8'))
+
+    def test_absent_file_is_created_with_parents(self):
+        self.assertEqual(statusline.install(str(self.settings), self.command), 'ajouté')
+        self.assertEqual(self.read(), {'statusLine': self.wanted})
+
+    def test_same_command_is_identical_without_write(self):
+        self.write(json.dumps({'statusLine': self.wanted}))
+        before = self.settings.stat().st_mtime_ns
+        self.assertEqual(statusline.install(str(self.settings), self.command), 'identique')
+        self.assertEqual(self.settings.stat().st_mtime_ns, before)
+
+    def test_other_status_line_is_kept_unless_replace(self):
+        self.write(json.dumps({'statusLine': {'type': 'command', 'command': 'other'}, 'theme': 'dark'}))
+        self.assertEqual(statusline.install(str(self.settings), self.command), 'conservé')
+        self.assertEqual(self.read()['statusLine']['command'], 'other')
+        self.assertEqual(statusline.install(str(self.settings), self.command, replace=True), 'remplacé')
+        self.assertEqual(self.read(), {'statusLine': self.wanted, 'theme': 'dark'})
+
+    def test_missing_key_is_added_and_other_keys_kept(self):
+        self.write(json.dumps({'permissions': {'allow': ['Bash']}}))
+        self.assertEqual(statusline.install(str(self.settings), self.command), 'ajouté')
+        self.assertEqual(self.read(), {'permissions': {'allow': ['Bash']}, 'statusLine': self.wanted})
+
+    def test_invalid_settings_raise_and_are_never_written(self):
+        for text in ('{broken', '[]'):
+            self.write(text)
+            with self.assertRaises(ValueError):
+                statusline.install(str(self.settings), self.command, replace=True)
+            self.assertEqual(self.settings.read_text(encoding='utf-8'), text)
+
+
+if __name__ == '__main__':
+    unittest.main()

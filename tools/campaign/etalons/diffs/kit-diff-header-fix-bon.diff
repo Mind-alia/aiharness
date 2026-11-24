@@ -1,0 +1,298 @@
+
+[TRUNCATED]
+diff --git a/template/scripts/lib/delegate_run.py b/template/scripts/lib/delegate_run.py
+--- a/template/scripts/lib/delegate_run.py
++++ b/template/scripts/lib/delegate_run.py
+@@ -4,6 +4,7 @@
+ import os
+ from pathlib import Path
+ import re
++import stat
+ import subprocess
+ 
+ from task import safe_path
+@@ -212,6 +213,12 @@
+     return answer
+ 
+ 
++def git_mode(st_mode):
++    if stat.S_ISLNK(st_mode):
++        return '120000'
++    return '100755' if st_mode & 0o111 else '100644'
++
++
+ def capture_initial(baseline, base_dir, values):
+     # Keep only masked, bounded task-time contents in memory. Never write raw
+     # initial files to Git objects, the index, or delegation artifacts.
+@@ -243,15 +250,15 @@
+         lines = difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
+                                      fromfile='a/' + name if name in initial else '/dev/null',
+                                      tofile='b/' + name if path.exists() else '/dev/null')
+-        headers = ['diff --git/' + name + ' b/' + name + '\n']
++        headers = ['diff --git a/' + name + ' b/' + name + '\n']
+         old_mode = baseline.get(name)
+         new_mode = fingerprint(path)
+         if old_mode is not None and new_mode is None:
+-            headers.append('deleted file mode %o\n' % old_mode[0])
++            headers.append('deleted file mode %s\n' % git_mode(old_mode[0]))
+         elif old_mode is None and new_mode is not None:
+-            headers.append('new file mode %o\n' % new_mode[0])
+-        elif old_mode and new_mode and old_mode[0] != new_mode[0]:
+-            headers.extend(['old mode %o\n' % old_mode[0], 'new mode %o\n' % new_mode[0]])
++            headers.append('new file mode %s\n' % git_mode(new_mode[0]))
++        elif old_mode and new_mode and git_mode(old_mode[0]) != git_mode(new_mode[0]):
++            headers.extend(['old mode %s\n' % git_mode(old_mode[0]), 'new mode %s\n' % git_mode(new_mode[0])])
+         for line in chain(headers, lines):
+             if not line.endswith('\n'):
+                 line += '\n\\ No newline at end of file\n'
+diff --git a/tests/test_diff_header.py b/tests/test_diff_header.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_diff_header.py
+@@ -0,0 +1,192 @@
++import contextlib
++import io
++import json
++import os
++from pathlib import Path
++import shutil
++import stat
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / 'template/scripts/lib'))
++sys.path.insert(0, str(ROOT / 'tools/campaign'))
++import delegate_run
++import etalons_harvest
++from scope import fingerprint
++
++IDENTITY = dict(GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.org',
++                GIT_COMMITTER_NAME='Test', GIT_COMMITTER_EMAIL='test@example.org')
++OLD_DIFF = (b'diff --git/notes.txt b/notes.txt\nnew file mode 100600\n--- /dev/null\n+++ b/notes.txt\n'
++            b'@@ -0,0 +1 @@\n+hello\n')
++
++
++def write(root, name, text, mode):
++    path = root / name
++    path.write_text(text)
++    os.chmod(str(path), mode)
++
++
++class GitModeTests(unittest.TestCase):
++    def test_regular_file_without_execute_bit(self):
++        self.assertEqual(delegate_run.git_mode(0o100600), '100644')
++        self.assertEqual(delegate_run.git_mode(0o100644), '100644')
++
++    def test_executable_file(self):
++        self.assertEqual(delegate_run.git_mode(0o100755), '100755')
++        self.assertEqual(delegate_run.git_mode(0o100711), '100755')
++
++    def test_symbolic_link(self):
++        self.assertEqual(delegate_run.git_mode(0o120777), '120000')
++
++
++class NormalizeTests(unittest.TestCase):
++    def test_old_header_and_mode_are_rewritten(self):
++        self.assertEqual(etalons_harvest.normalize(OLD_DIFF),
++                         OLD_DIFF.replace(b'diff --git/notes', b'diff --git a/notes')
++                         .replace(b'100600', b'100644'))
++
++    def test_deleted_file_mode_is_rewritten(self):
++        data = b'diff --git/gone.txt b/gone.txt\ndeleted file mode 100600\n'
++        self.assertEqual(etalons_harvest.normalize(data),
++                         b'diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n')
++
++    def test_equal_mode_pair_is_removed(self):
++        data = b'diff --git a/x b/x\nold mode 100644\nnew mode 100600\n@@ -1 +1 @@\n-a\n+b\n'
++        self.assertEqual(etalons_harvest.normalize(data), b'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n')
++
++    def test_executable_pair_is_kept_and_normalized(self):
++        data = b'diff --git a/run.sh b/run.sh\nold mode 100600\nnew mode 100755\n'
++        self.assertEqual(etalons_harvest.normalize(data),
++                         b'diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n')
++
++    def test_other_bytes_are_kept(self):
++        data = b'diff --git a/b.bin b/b.bin\n@@ -1 +1 @@\n-x\xff\r\n+y\xfe'
++        self.assertEqual(etalons_harvest.normalize(data), data)
++
++    def test_normalized_old_diff_is_accepted_by_git(self):
++        if shutil.which('git') is None:
++            self.skipTest('git absent')
++        with tempfile.TemporaryDirectory() as tmp:
++            done = subprocess.run(['git', 'apply', '--check', '-'], cwd=tmp, input=etalons_harvest.normalize(OLD_DIFF),
++                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++            self.assertEqual(done.returncode, 0, done.stdout)
++
++
++@unittest.skipIf(shutil.which('git') is None, 'git absent')
++class BuildDiffTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.base = Path(self.tmp.name) / 'base'
++        self.work = Path(self.tmp.name) / 'work'
++        self.base.mkdir()
++        self.git('init', '-q', '-b', 'initial', str(self.base))
++        write(self.base, 'edit.txt', 'one\ntwo\n', 0o644)
++        write(self.base, 'gone.txt', 'bye\n', 0o644)
++        write(self.base, 'secret.txt', 'key\n', 0o644)
++        write(self.base, 'run.sh', 'echo hi\n', 0o644)
++        self.git('-C', str(self.base), 'add', '.')
++        self.git('-C', str(self.base), 'commit', '-qm', 'base')
++        shutil.copytree(str(self.base), str(self.work), symlinks=True, ignore=shutil.ignore_patterns('.git'))
++
++    def git(self, *args):
++        done = subprocess.run(['git'] + list(args), env=dict(os.environ, **IDENTITY),
++                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++        self.assertEqual(done.returncode, 0, done.stdout)
++        return done.stdout
++
++    def change(self, name, text, mode=None):
++        write(self.work, name, text, mode if mode is not None else 0o644)
++
++    def diff_of(self, names, baseline):
++        initial = delegate_run.capture_initial(baseline, self.base, [])
++        return bytes(delegate_run.build_diff(names, self.work, initial, baseline, []))
++
++    def replay(self, diff, *options):
++        """Rejoue le diff sur une copie fraîche de la base ; renvoie le dossier rejoué."""
++        replay = Path(self.tmp.name) / 'replay'
++        shutil.copytree(str(self.base), str(replay), symlinks=True, ignore=shutil.ignore_patterns('.git'))
++        done = subprocess.run(['git', 'apply'] + list(options) + ['-'], cwd=str(replay), input=diff,
++                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++        self.assertEqual(done.returncode, 0, done.stdout)
++        return replay
++
++    def test_build_diff_applies_with_git(self):
++        names = ['edit.txt', 'gone.txt', 'run.sh', 'created.txt']
++        baseline = {name: fingerprint(self.base / name) for name in names if (self.base / name).exists()}
++        self.change('edit.txt', 'one\nthree\n')
++        (self.work / 'gone.txt').unlink()
++        self.change('run.sh', 'echo hi\n', 0o755)
++        self.change('created.txt', 'new\n', 0o600)
++        diff = self.diff_of(names, baseline)
++
++        self.assertIn(b'diff --git a/created.txt b/created.txt\nnew file mode 100644\n', diff)
++        self.assertIn(b'old mode 100644\nnew mode 100755\n', diff)
++        self.assertNotIn(b'diff --git/', diff)
++        self.assertNotIn(b'100600', diff)
++        replay = self.replay(diff)
++        self.assertEqual((replay / 'edit.txt').read_text(), 'one\nthree\n')
++        self.assertFalse((replay / 'gone.txt').exists())
++        self.assertEqual((replay / 'created.txt').read_text(), 'new\n')
++        self.assertTrue(os.stat(str(replay / 'run.sh')).st_mode & stat.S_IXUSR)
++
++    def test_mode_change_without_execute_bit_writes_no_mode_line(self):
++        baseline = {'secret.txt': fingerprint(self.base / 'secret.txt')}
++        self.change('secret.txt', 'key\n', 0o600)
++        diff = self.diff_of(['secret.txt'], baseline)
++        self.assertEqual(diff, b'diff --git a/secret.txt b/secret.txt\n')
++        self.replay(diff, '--allow-empty')
++
++
++@unittest.skipIf(shutil.which('git') is None, 'git absent')
++class HarvestOldDiffTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.project = Path(self.tmp.name).resolve() / 'Demo_Project'
++        self.project.mkdir()
++        self.git('init', '-q', '-b', 'initial')
++        (self.project / 'calc.py').write_text('def add(a, b):\n    return a + b\n')
++        self.git('add', '.')
++        self.git('commit', '-qm', 'base')
++        self.commit = self.git('rev-parse', 'HEAD').strip()
++
++    def git(self, *args):
++        done = subprocess.run(['git'] + list(args), cwd=str(self.project), env=dict(os.environ, **IDENTITY),
++                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
++        self.assertEqual(done.returncode, 0, done.stdout)
++        return done.stdout
++
++    def test_old_diff_is_harvested_as_applicable_etalon(self):
++        state = self.project / '.workspace/orchestration/tasks/calc-old'
++        run = self.project / '.workspace/run/delegate/calc-old'
++        state.mkdir(parents=True)
++        run.mkdir(parents=True)
++        (self.project / 'tasks').mkdir()
++        (self.project / 'tasks/calc-old.md').write_text(
++            '---\nid: calc-old\nagent: codex\nallowed: [calc.py, "tests/**"]\nacceptance: [eval/test_eval.py]\n'
++            'acceptance_verify: python3 -m unittest discover -s eval\n---\n# Fiche\n')
++        hidden = self.project / '.workspace/acceptance/calc-old/eval'
++        hidden.mkdir(parents=True)
++        (hidden / 'test_eval.py').write_text('import unittest\n\n\nclass E(unittest.TestCase):\n    pass\n')
++        (state / 'state.json').write_text(json.dumps(dict(
++            task_id='calc-old', agent='codex', status='merged', created_at='2026-10-10T10:00:00Z',
++            base_commit=self.commit, source_task='tasks/calc-old.md')))
++        (run / 'diff.txt').write_bytes(OLD_DIFF)
++        out = Path(self.tmp.name) / 'jeu'
++        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
++            code = etalons_harvest.main(['--harvest', str(self.project), '--out', str(out)])
++        self.assertEqual(code, 0)
++        written = (out / 'diffs/demo-project-calc-old-bon.diff').read_bytes()
++        self.assertTrue(written.startswith(b'diff --git a/'))
++        self.assertNotIn(b'100600', written)
++        done = subprocess.run(['git', 'apply', '--check', '-'], cwd=str(self.project), input=written,
++                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++        self.assertEqual(done.returncode, 0, done.stdout)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tools/campaign/etalons_harvest.py b/tools/campaign/etalons_harvest.py
+--- a/tools/campaign/etalons_harvest.py
++++ b/tools/campaign/etalons_harvest.py
+@@ -17,6 +17,7 @@
+ import etalons
+ from evaluation import evaluation_target
+ from task import read_task
++from delegate_run import git_mode
+ 
+ USAGE = ('usage: python3 tools/campaign/campaign.py etalons --harvest <projet> --out <dossier> [--configs <dossier>] '
+          '[--label <nom>] [--since AAAA-MM-JJ] [--only id1,id2] [--setup <commande>]')
+@@ -27,6 +28,33 @@
+ OUTSIDE = 'scripts/etalon-hors-perimetre.sh'
+ OUTSIDE_SECTION = ('diff --git a/%(p)s b/%(p)s\nnew file mode 100644\n--- /dev/null\n+++ b/%(p)s\n'
+                    '@@ -0,0 +1 @@\n+exit 0\n' % dict(p=OUTSIDE))
++HEADER_MODE = re.compile(rb'(new file|deleted file) mode ([0-7]+)\n')
++OLD_MODE = re.compile(rb'old mode ([0-7]+)\n')
++NEW_MODE = re.compile(rb'new mode ([0-7]+)\n')
++
++
++def normalize(data):
++    """Diff du circuit ramené aux en-têtes que `git apply` accepte ; les autres octets ne changent pas."""
++    lines = re.findall(rb'[^\n]*\n|[^\n]+\Z', data)
++    out, index = [], 0
++    while index < len(lines):
++        line = lines[index]
++        old = OLD_MODE.fullmatch(line)
++        new = NEW_MODE.fullmatch(lines[index + 1]) if old and index + 1 < len(lines) else None
++        if new:
++            old_mode, new_mode = git_mode(int(old.group(1), 8)), git_mode(int(new.group(1), 8))
++            if old_mode != new_mode:
++                out.extend([b'old mode ' + old_mode.encode() + b'\n', b'new mode ' + new_mode.encode() + b'\n'])
++            index += 2
++            continue
++        if line.startswith(b'diff --git/'):
++            line = b'diff --git a/' + line[len(b'diff --git/'):]
++        header = HEADER_MODE.fullmatch(line)
++        if header:
++            line = header.group(1) + b' mode ' + git_mode(int(header.group(2), 8)).encode() + b'\n'
++        out.append(line)
++        index += 1
++    return b''.join(out)
+ 
+ 
+ def parse(args):
+@@ -96,7 +124,7 @@
+     if missing:
+         return 'test caché absent : ' + missing[0], None
+     try:
+-        data = (run / 'diff.txt').read_bytes()
++        data = normalize((run / 'diff.txt').read_bytes())
+     except OSError:
+         return 'diff absent', None
+     lines = data.decode('utf-8', 'replace').splitlines()

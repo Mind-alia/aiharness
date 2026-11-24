@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$CLAUDE_PROJECT_DIR/scripts/lib/hooks_guard.py\" || { . \"$CLAUDE_PROJECT_DIR/scripts/python.sh\" && \"$WORKSPACE_PYTHON\" \"$CLAUDE_PROJECT_DIR/scripts/lib/hooks_guard.py\" pre-tool; }"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$CLAUDE_PROJECT_DIR/scripts/lib/hooks_guard.py\" || { . \"$CLAUDE_PROJECT_DIR/scripts/python.sh\" && \"$WORKSPACE_PYTHON\" \"$CLAUDE_PROJECT_DIR/scripts/lib/hooks_guard.py\" stop; }"
+          }
+        ]
+      }
+    ]
+  }
+}

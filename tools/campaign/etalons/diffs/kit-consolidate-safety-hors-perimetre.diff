@@ -1,0 +1,366 @@
+diff --git a/template/scripts/lib/alerts.py b/template/scripts/lib/alerts.py
+--- a/template/scripts/lib/alerts.py
++++ b/template/scripts/lib/alerts.py
+@@ -8,17 +8,9 @@
+ import urllib.parse
+ import urllib.request
+ 
++from safety import check_no_symlinks
++
+ MESSAGE = "Une question d'agent attend ta réponse"
+-
+-
+-def safe_path(path, root):
+-    current = path
+-    while True:
+-        if current.is_symlink():
+-            raise ValueError('Symlink in alerts path')
+-        if current == root or current.parent == current:
+-            return
+-        current = current.parent
+ 
+ 
+ def ntfy_topic():
+@@ -62,7 +54,7 @@
+ def read_alerts(root):
+     path = root / '.workspace/orchestration/alerts.jsonl'
+     try:
+-        safe_path(path, root)
++        check_no_symlinks(path, root)
+         with path.open(encoding='utf-8') as stream:
+             fcntl.flock(stream, fcntl.LOCK_SH)
+             return _rows(stream)
+@@ -78,7 +70,7 @@
+     directory = root / '.workspace/orchestration'
+     path = directory / 'alerts.jsonl'
+     try:
+-        safe_path(path, root)
++        check_no_symlinks(path, root)
+         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+         fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+         with os.fdopen(fd, 'a+', encoding='utf-8') as stream:
+@@ -87,7 +79,7 @@
+             if any(r['task_id'] == task_id and r['question'] == question for r in _rows(stream)):
+                 return
+             answer = directory / 'tasks' / task_id / 'context/answers' / (question + '.md')
+-            safe_path(answer, root)
++            check_no_symlinks(answer, root)
+             if answer.is_file():
+                 return
+             row = dict(at=datetime.now(timezone.utc).isoformat(), task_id=task_id,
+@@ -129,8 +121,8 @@
+         question = ctx / 'questions' / (key[1] + '.md')
+         answer = ctx / 'answers' / (key[1] + '.md')
+         try:
+-            safe_path(question, root)
+-            safe_path(answer, root)
++            check_no_symlinks(question, root)
++            check_no_symlinks(answer, root)
+             if question.is_file() and not answer.is_file():
+                 result.append(row)
+         except ValueError:
+diff --git a/template/scripts/lib/attack_bench.py b/template/scripts/lib/attack_bench.py
+--- a/template/scripts/lib/attack_bench.py
++++ b/template/scripts/lib/attack_bench.py
+@@ -24,6 +24,7 @@
+     sys.path.insert(0, str(LIB_DIR))
+ 
+ try:
++    from safety import check_no_symlinks
+     from secrets import known_values, mask_secrets
+ except ImportError:
+     def known_values(project_root: Path) -> List[str]:
+@@ -31,16 +32,6 @@
+ 
+     def mask_secrets(text: str, known: List[str]) -> str:
+         return text
+-
+-
+-def check_no_symlinks(path: Path, root: Path) -> None:
+-    curr = path
+-    while True:
+-        if curr.is_symlink():
+-            raise ValueError(f"Lien symbolique (symlink) interdit : {curr}")
+-        if curr == root or curr.parent == curr:
+-            break
+-        curr = curr.parent
+ 
+ 
+ def check_fail_is_blocked(returncode: int, stdout: str, stderr: str) -> Tuple[str, str]:
+diff --git a/template/scripts/lib/context.py b/template/scripts/lib/context.py
+--- a/template/scripts/lib/context.py
++++ b/template/scripts/lib/context.py
+@@ -13,7 +13,6 @@
+ """
+ from __future__ import annotations
+ 
+-import errno
+ import os
+ from pathlib import Path
+ import re
+@@ -21,18 +20,9 @@
+ import time
+ from typing import Optional, Tuple
+ 
++from safety import check_no_symlinks, write_file_secure
++
+ sys.dont_write_bytecode = True
+-
+-
+-def check_no_symlinks(path: Path, root: Path) -> None:
+-    """Vérifie qu'aucun composant entre root et path n'est un lien symbolique."""
+-    curr = path
+-    while True:
+-        if curr.is_symlink():
+-            raise ValueError(f"Lien symbolique (symlink) interdit : {curr}")
+-        if curr == root or curr.parent == curr:
+-            break
+-        curr = curr.parent
+ 
+ 
+ def get_context_dirs(root: Path, task_id: str) -> Tuple[Path, Path, Path]:
+@@ -63,30 +53,6 @@
+         check_no_symlinks(d, root)
+ 
+     return context_dir, questions_dir, answers_dir
+-
+-
+-def write_file_secure(file_path: Path, content: str) -> None:
+-    """Écrit atomiquement ou directement un fichier avec permissions 0600 sans suivre les liens."""
+-    if file_path.is_symlink():
+-        raise ValueError(f"Lien symbolique (symlink) interdit : {file_path}")
+-
+-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+-    if hasattr(os, 'O_NOFOLLOW'):
+-        flags |= os.O_NOFOLLOW
+-
+-    try:
+-        fd = os.open(file_path, flags, 0o600)
+-    except OSError as exc:
+-        if exc.errno == getattr(errno, 'ELOOP', None) or file_path.is_symlink():
+-            raise ValueError(f"Lien symbolique (symlink) interdit : {file_path}") from exc
+-        raise
+-
+-    with open(fd, 'w', encoding='utf-8') as f:
+-        f.write(content)
+-        if not content.endswith('\n'):
+-            f.write('\n')
+-
+-    file_path.chmod(0o600)
+ 
+ 
+ def is_in_worktree(root: Path) -> Tuple[bool, Optional[Path]]:
+
+[TRUNCATED]
+diff --git a/template/scripts/lib/exchange.py b/template/scripts/lib/exchange.py
+--- a/template/scripts/lib/exchange.py
++++ b/template/scripts/lib/exchange.py
+@@ -17,7 +17,6 @@
+ from __future__ import annotations
+ 
+ import datetime
+-import errno
+ import json
+ import os
+ from pathlib import Path
+@@ -36,43 +35,11 @@
+ 
+ try:
+     from secrets import known_values, mask_secrets
++    from safety import check_no_symlinks, write_file_secure
+ except ImportError:
+     pass
+ 
+ LIMIT_OUTPUT = 200 * 1024  # 200 Ko
+-
+-
+-def check_no_symlinks(path: Path, root: Path) -> None:
+-    curr = path
+-    while True:
+-        if curr.is_symlink():
+-            raise ValueError(f"Lien symbolique (symlink) interdit : {curr}")
+-        if curr == root or curr.parent == curr:
+-            break
+-        curr = curr.parent
+-
+-
+-def write_file_secure(file_path: Path, content: str) -> None:
+-    if file_path.is_symlink():
+-        raise ValueError(f"Lien symbolique (symlink) interdit : {file_path}")
+-
+-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+-    if hasattr(os, 'O_NOFOLLOW'):
+-        flags |= os.O_NOFOLLOW
+-
+-    try:
+-        fd = os.open(file_path, flags, 0o600)
+-    except OSError as exc:
+-        if exc.errno == getattr(errno, 'ELOOP', None) or file_path.is_symlink():
+-            raise ValueError(f"Lien symbolique (symlink) interdit : {file_path}") from exc
+-        raise
+-
+-    with open(fd, 'w', encoding='utf-8') as f:
+-        f.write(content)
+-        if not content.endswith('\n'):
+-            f.write('\n')
+-
+-    file_path.chmod(0o600)
+ 
+ 
+ def write_json_atomic(target_path: Path, data: Any) -> None:
+diff --git a/template/scripts/lib/safety.py b/template/scripts/lib/safety.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/safety.py
+@@ -0,0 +1,44 @@
++"""Primitives de sécurité partagées par les modules de template/scripts/lib (Python 3.9, stdlib seule)."""
++from __future__ import annotations
++
++import errno
++import os
++from pathlib import Path
++import sys
++
++sys.dont_write_bytecode = True
++
++
++def check_no_symlinks(path: Path, root: Path) -> None:
++    """Vérifie qu'aucun composant entre root et path n'est un lien symbolique."""
++    curr = path
++    while True:
++        if curr.is_symlink():
++            raise ValueError(f"Lien symbolique (symlink) interdit : {curr}")
++        if curr == root or curr.parent == curr:
++            break
++        curr = curr.parent
++
++
++def write_file_secure(file_path: Path, content: str) -> None:
++    """Écrit atomiquement ou directement un fichier avec permissions 0600 sans suivre les liens."""
++    if file_path.is_symlink():
++        raise ValueError(f"Lien symbolique (symlink) interdit : {file_path}")
++
++    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
++    if hasattr(os, 'O_NOFOLLOW'):
++        flags |= os.O_NOFOLLOW
++
++    try:
++        fd = os.open(file_path, flags, 0o600)
++    except OSError as exc:
++        if exc.errno == getattr(errno, 'ELOOP', None) or file_path.is_symlink():
++            raise ValueError(f"Lien symbolique (symlink) interdit : {file_path}") from exc
++        raise
++
++    with open(fd, 'w', encoding='utf-8') as f:
++        f.write(content)
++        if not content.endswith('\n'):
++            f.write('\n')
++
++    file_path.chmod(0o600)
+diff --git a/template/scripts/lib/sandbox.py b/template/scripts/lib/sandbox.py
+--- a/template/scripts/lib/sandbox.py
++++ b/template/scripts/lib/sandbox.py
+@@ -36,6 +36,7 @@
+     sys.path.insert(0, str(LIB_DIR))
+ 
+ try:
++    from safety import check_no_symlinks
+     from secrets import known_values, mask_secrets
+     from task import read_task
+ except ImportError:
+@@ -47,16 +48,6 @@
+ DEFAULT_CPUS = '2'
+ DEFAULT_MEMORY = '4g'
+ DEFAULT_USER = '1000:1000'
+-
+-
+-def check_no_symlinks(path: Path, root: Path) -> None:
+-    curr = path
+-    while True:
+-        if curr.is_symlink():
+-            raise ValueError(f"Lien symbolique (symlink) interdit : {curr}")
+-        if curr == root or curr.parent == curr:
+-            break
+-        curr = curr.parent
+ 
+ 
+ def get_docker_binary() -> str:
+diff --git a/tests/test_safety.py b/tests/test_safety.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_safety.py
+@@ -0,0 +1,68 @@
++"""Tests unitaires de template/scripts/lib/safety.py (aucun accès réseau)."""
++import os
++from pathlib import Path
++import stat
++import sys
++import tempfile
++import unittest
++
++LIB = Path(__file__).resolve().parents[1] / 'template/scripts/lib'
++sys.path.insert(0, str(LIB))
++
++import safety  # noqa: E402
++
++
++class SafetyTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name).resolve()
++
++    def test_direct_path_is_accepted(self):
++        target = self.root / 'file.txt'
++        target.write_text('x', encoding='utf-8')
++
++        safety.check_no_symlinks(target, self.root)
++
++    def test_root_itself_is_accepted(self):
++        safety.check_no_symlinks(self.root, self.root)
++
++    def test_symlink_on_intermediate_component_is_refused(self):
++        real = self.root / 'real'
++        real.mkdir()
++        (real / 'file.txt').write_text('x', encoding='utf-8')
++        os.symlink(real, self.root / 'link')
++
++        with self.assertRaises(ValueError):
++            safety.check_no_symlinks(self.root / 'link' / 'file.txt', self.root)
++
++    def test_symlink_on_last_component_is_refused(self):
++        target = self.root / 'target.txt'
++        target.write_text('x', encoding='utf-8')
++        os.symlink(target, self.root / 'link.txt')
++
++        with self.assertRaises(ValueError):
++            safety.check_no_symlinks(self.root / 'link.txt', self.root)
++
++    def test_write_creates_file_with_mode_0600(self):
++        target = self.root / 'answer.md'
++
++        safety.write_file_secure(target, 'réponse')
++
++        self.assertEqual(target.read_text(encoding='utf-8'), 'réponse\n')
++        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
++
++    def test_write_refuses_symlink_and_leaves_target_untouched(self):
++        victim = self.root / 'victim.txt'
++        victim.write_text('intact', encoding='utf-8')
++        link = self.root / 'link.md'
++        os.symlink(victim, link)
++
++        with self.assertRaises(ValueError):
++            safety.write_file_secure(link, 'écrasé')
++
++        self.assertEqual(victim.read_text(encoding='utf-8'), 'intact')
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

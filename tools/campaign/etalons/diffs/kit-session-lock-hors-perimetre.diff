@@ -1,0 +1,517 @@
+diff --git a/template/scripts/lib/events.py b/template/scripts/lib/events.py
+--- a/template/scripts/lib/events.py
++++ b/template/scripts/lib/events.py
+@@ -23,7 +23,8 @@
+ 
+ EVENTS_PATH = '.workspace/events.jsonl'
+ KINDS = ('prepared', 'delegate_started', 'attempt_started', 'attempt_finished', 'verify',
+-         'acceptance', 'outcome', 'merged', 'closed', 'quota')
++         'acceptance', 'outcome', 'merged', 'closed', 'quota', 'orchestrator_claimed', 'orchestrator_released',
++         'selfcheck')
+ 
+ 
+ def _warn(error):
+diff --git a/template/scripts/lib/orchestrator.py b/template/scripts/lib/orchestrator.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/orchestrator.py
+@@ -0,0 +1,233 @@
++"""Verrou d'orchestration déclaratif et état d'ensemble (Python 3.9, stdlib seule).
++
++`claim` déclare qu'une session orchestre ce dépôt dans `.workspace/orchestrator.json`,
++`release` retire la déclaration, `status` résume verrou, tâches actives, conteneurs et
++processus d'agents. Le verrou n'empêche aucune autre commande : il ne fait que se voir.
++"""
++from __future__ import annotations
++
++import argparse
++import datetime
++import json
++import os
++from pathlib import Path
++import shutil
++import socket
++import subprocess
++import sys
++import tempfile
++
++import events
++import safety
++
++sys.dont_write_bytecode = True
++
++LOCK_PATH = '.workspace/orchestrator.json'
++TASKS_GLOB = '.workspace/orchestration/tasks/*/state.json'
++ORCHESTRATOR_ID = 'orchestrator'
++ACTIVE_STATUSES = ('prepared', 'running', 'merge_conflict', 'integration_failed')
++PROCESS_MARKERS = ('claude -p', 'codex', 'campaign.py')
++COMMAND_LIMIT = 160
++SUBPROCESS_TIMEOUT = 10
++EXIT_HELD = 3
++EXIT_USAGE = 64
++USAGE = ('usage : orchestrator.sh claim [--session NOM] [--model NOM] [--repos CHEMIN[,CHEMIN...]] '
++         '[--pid N] [--force]\n        orchestrator.sh release\n        orchestrator.sh status')
++
++
++def _lock_path(root):
++    path = root / LOCK_PATH
++    safety.check_no_symlinks(path, root)
++    return path
++
++
++def _read_lock(path):
++    """Contenu du verrou, ou `None` s'il est illisible ou n'est pas un objet JSON."""
++    try:
++        data = json.loads(path.read_text(encoding='utf-8'))
++    except (OSError, ValueError):
++        return None
++    return data if isinstance(data, dict) else None
++
++
++def _write_atomic(path, data):
++    fd, temp = tempfile.mkstemp(dir=str(path.parent), prefix='.orchestrator-', suffix='.tmp')
++    try:
++        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
++            stream.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
++        os.chmod(temp, 0o600)
++        os.replace(temp, path)
++    except BaseException:
++        try:
++            os.unlink(temp)
++        except OSError:
++            pass
++        raise
++
++
++def claim(root, args):
++    path = _lock_path(root)
++    if os.path.lexists(path) and not args.force:
++        held = _read_lock(path)
++        name = held.get('session') if held else None
++        print('verrou déjà pris par la session %s ; --force pour le remplacer' % (name or 'inconnue'),
++              file=sys.stderr)
++        return EXIT_HELD
++    pid = args.pid if args.pid is not None else os.getppid()
++    data = {
++        'session': args.session or '%s-%d' % (socket.gethostname(), pid),
++        'model': args.model or 'inconnu',
++        'started_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
++        'pid': pid,
++        'repos': [item.strip() for item in args.repos.split(',') if item.strip()] if args.repos else [str(root)],
++    }
++    if not path.parent.exists():
++        path.parent.mkdir(mode=0o700)
++    _write_atomic(path, data)
++    events.record(root, ORCHESTRATOR_ID, 'orchestrator_claimed',
++                  {'session': data['session'], 'model': data['model'], 'pid': pid})
++    print('verrou pris : %s (%s)' % (data['session'], data['model']))
++    return 0
++
++
++def release(root, _args):
++    path = _lock_path(root)
++    if not os.path.lexists(path):
++        print('aucun verrou')
++        return 0
++    held = _read_lock(path)
++    path.unlink()
++    events.record(root, ORCHESTRATOR_ID, 'orchestrator_released',
++                  {'session': held.get('session') if held else None})
++    print('verrou libéré')
++    return 0
++
++
++def _pid_alive(pid):
++    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
++        return False
++    try:
++        os.kill(pid, 0)
++    except PermissionError:
++        return True
++    except OSError:
++        return False
++    return True
++
++
++def _lock_line(root):
++    path = _lock_path(root)
++    if not os.path.lexists(path):
++        return 'verrou : aucun'
++    held = _read_lock(path)
++    if held is None:
++        return 'verrou : illisible'
++    state = 'vivant' if _pid_alive(held.get('pid')) else 'terminé'
++    return 'verrou : %s (%s) depuis %s, pid %s (%s)' % (
++        held.get('session'), held.get('model'), held.get('started_at'), held.get('pid'), state)
++
++
++def _task_lines(root):
++    lines = []
++    for state_file in sorted(root.glob(TASKS_GLOB)):
++        try:
++            safety.check_no_symlinks(state_file, root)
++            data = json.loads(state_file.read_text(encoding='utf-8'))
++            status = data['status'] if isinstance(data, dict) else None
++        except (OSError, ValueError, KeyError):
++            status = None
++        if not isinstance(status, str):
++            lines.append('tâche illisible : %s' % state_file.parent.name)
++        elif status in ACTIVE_STATUSES:
++            lines.append('tâche active : %s (%s)' % (state_file.parent.name, status))
++    return lines or ['tâches actives : aucune']
++
++
++def _container_lines():
++    command = ['docker', 'ps', '--filter', 'name=workspace-sandbox-', '--format', '{{.Names}}']
++    try:
++        done = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                              stderr=subprocess.DEVNULL, universal_newlines=True, timeout=SUBPROCESS_TIMEOUT)
++    except (OSError, subprocess.SubprocessError):
++        return ['conteneurs : docker indisponible']
++    if done.returncode != 0:
++        return ['conteneurs : docker indisponible']
++    names = [line.strip() for line in done.stdout.splitlines() if line.strip()]
++    return ['conteneur : ' + name for name in names] or ['conteneurs : aucun']
++
++
++def _list_processes():
++    """Couples (pid, ligne de commande) : `ps` s'il existe, sinon `/proc`."""
++    found = []
++    if shutil.which('ps'):
++        done = subprocess.run(['ps', '-eo', 'pid=,args='], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                              stderr=subprocess.DEVNULL, universal_newlines=True, timeout=SUBPROCESS_TIMEOUT)
++        for line in done.stdout.splitlines():
++            pid, _, command = line.strip().partition(' ')
++            if pid.isdigit() and command.strip():
++                found.append((int(pid), command.strip()))
++        return found
++    for entry in Path('/proc').iterdir():
++        if not entry.name.isdigit():
++            continue
++        try:
++            raw = (entry / 'cmdline').read_bytes()
++        except OSError:
++            continue
++        command = raw.replace(b'\0', b' ').decode('utf-8', errors='replace').strip()
++        if command:
++            found.append((int(entry.name), command))
++    return found
++
++
++def _process_lines():
++    own = {os.getpid(), os.getppid()}
++    try:
++        processes = _list_processes()
++    except (OSError, subprocess.SubprocessError):
++        processes = []
++    lines = ['processus : %d %s' % (pid, ' '.join(command.split())[:COMMAND_LIMIT])
++             for pid, command in processes
++             if pid not in own and any(marker in command for marker in PROCESS_MARKERS)]
++    return lines or ['processus : aucun']
++
++
++def status(root, _args):
++    for line in [_lock_line(root)] + _task_lines(root) + _container_lines() + _process_lines():
++        print(line)
++    return 0
++
++
++def _claim_parser():
++    parser = argparse.ArgumentParser(prog='orchestrator.sh claim')
++    parser.add_argument('--session')
++    parser.add_argument('--model')
++    parser.add_argument('--repos', help='chemins séparés par des virgules')
++    parser.add_argument('--pid', type=int)
++    parser.add_argument('--force', action='store_true')
++    return parser
++
++
++def main(argv):
++    for stream in (sys.stdout, sys.stderr):
++        stream.reconfigure(encoding='utf-8', errors='replace')
++    if len(argv) < 3 or argv[2] not in ('claim', 'release', 'status'):
++        print(USAGE, file=sys.stderr)
++        return EXIT_USAGE
++    root, command, rest = Path(argv[1]), argv[2], argv[3:]
++    if command == 'claim':
++        args = _claim_parser().parse_args(rest)
++    elif rest:
++        print(USAGE, file=sys.stderr)
++        return EXIT_USAGE
++    else:
++        args = None
++    try:
++        return {'claim': claim, 'release': release, 'status': status}[command](root, args)
++    except (OSError, ValueError) as error:
++        print('orchestrator: ' + str(error).replace('\n', ' '), file=sys.stderr)
++        return 1
++
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv))
+diff --git a/template/scripts/orchestrator.sh b/template/scripts/orchestrator.sh
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/orchestrator.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++# Usage: scripts/orchestrator.sh claim [--session NOM] [--model NOM] [--repos CHEMIN[,CHEMIN...]] [--pid N] [--force]
++#        scripts/orchestrator.sh release | status
++umask 077
++set -eu
++root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
++exec python3 "$root/scripts/lib/orchestrator.py" "$root" "$@"
+diff --git a/tests/test_events.py b/tests/test_events.py
+--- a/tests/test_events.py
++++ b/tests/test_events.py
+@@ -38,7 +38,8 @@
+     def test_kinds_are_the_agreed_vocabulary(self):
+         self.assertEqual(events.KINDS, (
+             'prepared', 'delegate_started', 'attempt_started', 'attempt_finished', 'verify',
+-            'acceptance', 'outcome', 'merged', 'closed', 'quota'))
++            'acceptance', 'outcome', 'merged', 'closed', 'quota', 'orchestrator_claimed', 'orchestrator_released',
++            'selfcheck'))
+ 
+     def test_record_appends_sorted_json_lines_in_utc(self):
+         events.record(self.root, 'demo', 'attempt_started', {'z': 1, 'attempt': 1, 'text': 'é'})
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_orchestrator.py
+@@ -0,0 +1,230 @@
++import json
++import os
++from pathlib import Path
++import shutil
++import stat
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++BASH = shutil.which('bash')
++
++
++def run(root, env, *args):
++    return subprocess.run([BASH, str(root / 'scripts/orchestrator.sh')] + list(args), env=env,
++                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                          universal_newlines=True, encoding='utf-8')
++
++
++class OrchestratorTests(unittest.TestCase):
++
++    def setUp(self):
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        self.root = Path(tmp.name) / 'project'
++        (self.root / 'scripts/lib').mkdir(parents=True)
++        shutil.copytree(ROOT / 'template/scripts/lib', self.root / 'scripts/lib', dirs_exist_ok=True,
++                        ignore=shutil.ignore_patterns('__pycache__'))
++        shutil.copy(ROOT / 'template/scripts/orchestrator.sh', self.root / 'scripts/orchestrator.sh')
++        self.bin = Path(tmp.name) / 'bin'
++        self.bin.mkdir()
++        self.fake_docker('printf "workspace-sandbox-a\\nworkspace-sandbox-b\\n"')
++        self.env = self.make_env(self.bin)
++        self.lock = self.root / '.workspace/orchestrator.json'
++
++    def make_env(self, *path_dirs):
++        env = dict(os.environ)
++        env['PATH'] = os.pathsep.join(str(item) for item in path_dirs)
++        return env
++
++    def fake_docker(self, body):
++        script = self.bin / 'docker'
++        script.write_text('#!/bin/sh\n' + body + '\n')
++        script.chmod(0o755)
++        # python3 and dirname are what orchestrator.sh needs; ps is deliberately left out unless faked.
++        for name in ('python3', 'dirname'):
++            target = self.bin / name
++            if not target.exists():
++                target.symlink_to(shutil.which(name))
++
++    def fake_ps(self, listing):
++        # PATH holds only the fake tools: no `cat`, so the fake prints the file with shell builtins.
++        script = self.bin / 'ps'
++        script.write_text('#!/bin/sh\nwhile IFS= read -r line; do echo "$line"; done < "%s"\n' % listing)
++        script.chmod(0o755)
++
++    def no_docker_env(self):
++        empty = self.bin.parent / 'nodocker'
++        empty.mkdir(exist_ok=True)
++        for name in ('python3', 'dirname'):
++            if not (empty / name).exists():
++                (empty / name).symlink_to(shutil.which(name))
++        return self.make_env(empty), empty
++
++    def events(self):
++        path = self.root / '.workspace/events.jsonl'
++        return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else []
++
++    def status_lines(self, env=None):
++        done = run(self.root, env or self.env, 'status')
++        self.assertEqual(done.returncode, 0, done.stderr)
++        return done.stdout.splitlines()
++
++    def test_claim_status_refusal_force_release_cycle(self):
++        done = run(self.root, self.env, 'claim', '--session', 'nuit', '--model', 'opus', '--pid', str(os.getpid()))
++        self.assertEqual(done.returncode, 0, done.stderr)
++        data = json.loads(self.lock.read_text(encoding='utf-8'))
++        self.assertEqual(sorted(data), ['model', 'pid', 'repos', 'session', 'started_at'])
++        self.assertEqual((data['session'], data['model'], data['pid']), ('nuit', 'opus', os.getpid()))
++        self.assertEqual(data['repos'], [str(self.root)])
++        self.assertRegex(data['started_at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
++
++        first = self.status_lines()[0]
++        self.assertEqual(first, 'verrou : nuit (opus) depuis %s, pid %d (vivant)' % (data['started_at'], os.getpid()))
++
++        before = self.lock.read_text(encoding='utf-8')
++        refused = run(self.root, self.env, 'claim', '--session', 'jour')
++        self.assertEqual(refused.returncode, 3)
++        self.assertIn('nuit', refused.stderr)
++        self.assertIn('--force', refused.stderr)
++        self.assertEqual(self.lock.read_text(encoding='utf-8'), before)
++        self.assertEqual(len(self.events()), 1)
++
++        forced = run(self.root, self.env, 'claim', '--force', '--session', 'jour', '--repos', 'a, b,,c')
++        self.assertEqual(forced.returncode, 0, forced.stderr)
++        data = json.loads(self.lock.read_text(encoding='utf-8'))
++        self.assertEqual((data['session'], data['model'], data['repos']), ('jour', 'inconnu', ['a', 'b', 'c']))
++
++        released = run(self.root, self.env, 'release')
++        self.assertEqual(released.returncode, 0, released.stderr)
++        self.assertFalse(self.lock.exists())
++        self.assertEqual(self.status_lines()[0], 'verrou : aucun')
++
++        self.assertEqual([(item['task_id'], item['event'], item['detail']) for item in self.events()], [
++            ('orchestrator', 'orchestrator_claimed', {'session': 'nuit', 'model': 'opus', 'pid': os.getpid()}),
++            ('orchestrator', 'orchestrator_claimed', {'session': 'jour', 'model': 'inconnu', 'pid': data['pid']}),
++            ('orchestrator', 'orchestrator_released', {'session': 'jour'})])
++
++    def test_claim_defaults_and_file_mode(self):
++        done = run(self.root, self.env, 'claim')
++        self.assertEqual(done.returncode, 0, done.stderr)
++        data = json.loads(self.lock.read_text(encoding='utf-8'))
++        self.assertEqual(data['pid'], os.getpid())
++        self.assertTrue(data['session'].endswith('-%d' % os.getpid()), data['session'])
++        self.assertEqual(data['model'], 'inconnu')
++        self.assertEqual(stat.S_IMODE(self.lock.stat().st_mode), 0o600)
++        self.assertEqual(stat.S_IMODE(self.lock.parent.stat().st_mode), 0o700)
++        self.assertEqual([path.name for path in self.lock.parent.iterdir() if path.name.endswith('.tmp')], [])
++
++    def test_release_without_lock_is_silent_for_the_journal(self):
++        done = run(self.root, self.env, 'release')
++        self.assertEqual(done.returncode, 0)
++        self.assertIn('aucun verrou', done.stdout)
++        self.assertEqual(self.events(), [])
++
++    def test_symlinks_are_refused(self):
++        outside = self.root.parent / 'outside.json'
++        outside.write_text('{}')
++        (self.root / '.workspace').mkdir()
++        self.lock.symlink_to(outside)
++        for command in (['release'], ['claim', '--force']):
++            done = run(self.root, self.env, *command)
++            self.assertNotEqual(done.returncode, 0, command)
++            self.assertIn('symbolique', done.stderr)
++        self.assertEqual(outside.read_text(), '{}')
++        self.lock.unlink()
++        elsewhere = self.root.parent / 'elsewhere'
++        elsewhere.mkdir()
++        (self.root / '.workspace').rmdir()
++        (self.root / '.workspace').symlink_to(elsewhere)
++        self.assertNotEqual(run(self.root, self.env, 'claim').returncode, 0)
++        self.assertEqual(list(elsewhere.iterdir()), [])
++
++    def test_status_reports_dead_pid_and_unreadable_lock(self):
++        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
++        dead.wait()
++        run(self.root, self.env, 'claim', '--session', 's', '--pid', str(dead.pid))
++        self.assertTrue(self.status_lines()[0].endswith('(terminé)'))
++        self.lock.write_text('pas du json')
++        self.assertEqual(self.status_lines()[0], 'verrou : illisible')
++
++    def test_status_lists_active_tasks_and_tolerates_unreadable_state(self):
++        tasks = self.root / '.workspace/orchestration/tasks'
++        for name, content in [('a-run', '{"status": "running"}'), ('b-done', '{"status": "merged"}'),
++                              ('c-conflict', '{"status": "merge_conflict"}'), ('d-bad', '{oups'),
++                              ('e-prep', '{"status": "prepared"}'), ('f-fail', '{"status": "integration_failed"}'),
++                              ('g-list', '[1]')]:
++            (tasks / name).mkdir(parents=True)
++            (tasks / name / 'state.json').write_text(content)
++        lines = self.status_lines()
++        self.assertEqual([line for line in lines if line.startswith('tâche')], [
++            'tâche active : a-run (running)', 'tâche active : c-conflict (merge_conflict)',
++            'tâche illisible : d-bad', 'tâche active : e-prep (prepared)',
++            'tâche active : f-fail (integration_failed)', 'tâche illisible : g-list'])
++        self.assertNotIn('tâches actives : aucune', lines)
++
++    def test_status_without_tasks(self):
++        lines = self.status_lines()
++        self.assertIn('tâches actives : aucune', lines)
++        self.assertIn('verrou : aucun', lines)
++
++    def test_status_lists_containers_from_docker(self):
++        lines = self.status_lines()
++        self.assertIn('conteneur : workspace-sandbox-a', lines)
++        self.assertIn('conteneur : workspace-sandbox-b', lines)
++        self.fake_docker('exit 0')
++        self.assertIn('conteneurs : aucun', self.status_lines())
++
++    def test_status_without_docker_or_with_failing_docker(self):
++        env, _ = self.no_docker_env()
++        lines = self.status_lines(env)
++        self.assertIn('conteneurs : docker indisponible', lines)
++        self.fake_docker('echo boom >&2; exit 1')
++        self.assertIn('conteneurs : docker indisponible', self.status_lines())
++
++    def test_status_filters_processes_from_ps(self):
++        listing = self.bin.parent / 'ps.txt'
++        long_command = 'claude -p ' + 'x' * 400
++        listing.write_text('\n'.join([
++            '  101 /usr/bin/python3 scripts/lib/campaign.py --go',
++            '  102 vim notes.md',
++            '  103 codex exec "tâche"',
++            '  %d codex mon parent' % os.getpid(),
++            '  104 ' + long_command,
++            '  105 node claude -p "x"']) + '\n')
++        self.fake_ps(listing)
++        processes = [line for line in self.status_lines() if line.startswith('processus')]
++        self.assertEqual(processes[:2], ['processus : 101 /usr/bin/python3 scripts/lib/campaign.py --go',
++                                         'processus : 103 codex exec "tâche"'])
++        self.assertEqual(processes[2], 'processus : 104 ' + long_command[:160])
++        self.assertEqual(processes[3], 'processus : 105 node claude -p "x"')
++        self.assertEqual(len(processes), 4)
++
++    def test_status_without_matching_process(self):
++        listing = self.bin.parent / 'ps.txt'
++        listing.write_text('  7 vim notes.md\n')
++        self.fake_ps(listing)
++        self.assertIn('processus : aucun', self.status_lines())
++
++    @unittest.skipUnless(os.path.isdir('/proc/self'), 'pas de /proc')
++    def test_status_reads_proc_when_ps_is_absent(self):
++        env, _ = self.no_docker_env()
++        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)', 'campaign.py'])
++        self.addCleanup(child.wait)
++        self.addCleanup(child.kill)
++        lines = self.status_lines(env)
++        self.assertTrue(any(line.startswith('processus : %d ' % child.pid) and 'campaign.py' in line
++                            for line in lines), lines)
++
++    def test_usage(self):
++        for args in ([], ['inconnue'], ['status', 'extra']):
++            done = run(self.root, self.env, *args)
++            self.assertEqual(done.returncode, 64, args)
++            self.assertIn('usage', done.stderr)
++        self.assertFalse(self.lock.exists())
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

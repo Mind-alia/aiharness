@@ -1,0 +1,130 @@
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -7,9 +7,12 @@
+ import sys
+ import tempfile
+ import unittest
++from unittest import mock
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ BASH = shutil.which('bash')
++sys.path.insert(0, str(ROOT / 'template/scripts/lib'))
++import orchestrator  # noqa: E402
+ 
+ 
+ def run(root, env, *args):
+@@ -208,6 +211,61 @@
+         self.fake_ps(listing)
+         self.assertIn('processus : aucun', self.status_lines())
+ 
++    def test_status_ignores_chatgpt_codex_services(self):
++        listing = self.bin.parent / 'ps.txt'
++        listing.write_text('\n'.join([
++            '  201 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
++            '  202 Codex (Service)',
++            '  203 /Applications/ChatGPT.app/Contents/Resources/codex app-server',
++            '  204 /Applications/ChatGPT.app/Contents/Resources/codex --flag exec-server',
++            '  205 Codex Computer Use',
++            '  206 vim codex-notes.md',
++            '  207 /opt/homebrew/bin/codex exec "tâche"',
++            '  208 node /usr/lib/node_modules/@openai/codex@0.162.1 exec "x"']) + '\n')
++        self.fake_ps(listing)
++        processes = [line for line in self.status_lines() if line.startswith('processus')]
++        self.assertEqual(processes, ['processus : 207 /opt/homebrew/bin/codex exec "tâche"',
++                                     'processus : 208 node /usr/lib/node_modules/@openai/codex@0.162.1 exec "x"'])
++
++    def test_claim_without_pid_records_the_session_process_behind_shells(self):
++        # Python appelant -> bash -c -> bash orchestrator.sh (exec python3) : le pid de l'appelant est retenu.
++        env = self.make_env(self.bin, *os.environ.get('PATH', '').split(os.pathsep))
++        done = subprocess.run([BASH, '-c', 'bash "$0" claim; true', str(self.root / 'scripts/orchestrator.sh')],
++                              env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                              stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8')
++        self.assertEqual(done.returncode, 0, done.stderr)
++        self.assertEqual(json.loads(self.lock.read_text(encoding='utf-8'))['pid'], os.getpid())
++
++    def test_status_lists_tasks_of_declared_repos_and_campaign_arms(self):
++        other = self.root.parent / 'other'
++        self.write_task(self.root / '.workspace/orchestration/tasks/z-own', 'running')
++        self.write_task(self.root / '.workspace/campaign/u1/.workspace/orchestration/tasks/c-run', 'running')
++        self.write_task(other / '.workspace/orchestration/tasks/x-run', 'running')
++        self.write_task(other / '.workspace/campaign/u2/.workspace/orchestration/tasks/y-conf', 'merge_conflict')
++        self.write_task(other / '.workspace/orchestration/tasks/w-merged', 'merged')
++        (other / '.workspace/orchestration/tasks/v-link').mkdir(parents=True)
++        outside = self.root.parent / 'outside-state.json'
++        outside.write_text('{"status": "running"}')
++        (other / '.workspace/orchestration/tasks/v-link/state.json').symlink_to(outside)
++        missing = self.root.parent / 'absent'
++        done = run(self.root, self.env, 'claim', '--session', 's', '--pid', str(os.getpid()),
++                   '--repos', '%s,%s' % (other, missing))
++        self.assertEqual(done.returncode, 0, done.stderr)
++        self.assertEqual([line for line in self.status_lines() if line.startswith('tâche')], [
++            'tâche active : z-own (running)', 'tâche active : c-run (running)',
++            'tâche illisible : v-link [%s]' % other,
++            'tâche active : x-run (running) [%s]' % other,
++            'tâche active : y-conf (merge_conflict) [%s]' % other])
++
++    def test_status_without_lock_lists_only_the_current_repo(self):
++        other = self.root.parent / 'other'
++        self.write_task(other / '.workspace/orchestration/tasks/x-run', 'running')
++        self.assertIn('tâches actives : aucune', self.status_lines())
++
++    def write_task(self, directory, status):
++        directory.mkdir(parents=True, exist_ok=True)
++        (directory / 'state.json').write_text(json.dumps({'status': status}))
++
+     @unittest.skipUnless(os.path.isdir('/proc/self'), 'pas de /proc')
+     def test_status_reads_proc_when_ps_is_absent(self):
+         env, _ = self.no_docker_env()
+@@ -226,5 +284,51 @@
+         self.assertFalse(self.lock.exists())
+ 
+ 
++class SessionPidTests(unittest.TestCase):
++
++    def setUp(self):
++        self.table = {}
++        patcher = mock.patch.object(orchestrator, '_process_info', side_effect=lambda pid: self.table.get(pid))
++        patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def test_skips_shells_and_keeps_the_first_other_process(self):
++        self.table = {10: (11, 'bash'), 11: (12, 'zsh'), 12: (13, 'python3'), 13: (1, 'launchd')}
++        self.assertEqual(orchestrator._session_pid(10), 12)
++
++    def test_a_shell_whose_parent_is_init_is_kept(self):
++        self.table = {10: (1, 'bash')}
++        self.assertEqual(orchestrator._session_pid(10), 10)
++
++    def test_init_is_never_recorded_in_place_of_the_last_other_process(self):
++        self.table = {10: (1, 'sh'), 1: (0, 'launchd')}
++        self.assertNotEqual(orchestrator._session_pid(10), 1)
++
++    def test_stops_after_sixteen_levels_of_shells(self):
++        self.table = {pid: (pid + 1, 'bash') for pid in range(10, 27)}
++        self.table[27] = (1, 'python3')
++        self.assertEqual(orchestrator._session_pid(10), 26)
++
++    def test_unreadable_process_keeps_the_current_pid(self):
++        self.assertEqual(orchestrator._session_pid(10), 10)
++        self.table = {10: (11, 'bash')}
++        self.assertEqual(orchestrator._session_pid(10), 11)
++
++    def test_command_name_drops_path_and_login_dash(self):
++        self.assertEqual(orchestrator._command_name('-zsh'), 'zsh')
++        self.assertEqual(orchestrator._command_name('/bin/bash'), 'bash')
++        self.assertEqual(orchestrator._command_name(' python3 '), 'python3')
++
++
++class ProcessInfoTests(unittest.TestCase):
++
++    @unittest.skipUnless(os.path.isdir('/proc/self'), 'pas de /proc')
++    def test_process_info_reads_proc_without_ps(self):
++        with mock.patch.object(orchestrator.shutil, 'which', return_value=None):
++            info = orchestrator._process_info(os.getpid())
++        self.assertEqual(info[0], os.getppid())
++        self.assertTrue(info[1])
++
++
+ if __name__ == '__main__':
+     unittest.main()

@@ -1,0 +1,18 @@
+{
+  "project": "../../../console",
+  "start_commit": "REMPLACER_PAR_UN_SHA_GIT",
+  "seed": 20261017,
+  "repetitions": 2,
+  "output": "mesures-exemple",
+  "arms": ["opus-seul", "codex-seul", "systeme-claude-haiku", "systeme-codex"],
+  "tasks": [
+    {
+      "id": "projection-quota",
+      "request": "demandes/projection-quota.md",
+      "allowed": ["apps/service/src/**", "packages/contracts/src/**"],
+      "evaluation_files": ["evaluation/projection-quota.test.ts"],
+      "evaluation_target": "apps/service/src/domain/usage/evaluation-campagne",
+      "evaluation_command": ["bash", "-c", "npx vitest run apps/service/src/domain/usage/evaluation-campagne --reporter=tap"]
+    }
+  ]
+}

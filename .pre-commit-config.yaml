@@ -1,0 +1,16 @@
+# Checks run before each commit (`pre-commit install`, done on 27/10 at the owner's request). The circuit's own git calls
+# run with core.hooksPath=/dev/null and never go through it.
+# Same pinned tools as the Makefile; the suite enforces the same rules (tests/test_code_quality.py).
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-lint
+        name: ruff check
+        entry: uvx ruff@0.17.2 check --force-exclude
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format --check
+        entry: uvx ruff@0.17.2 format --check --force-exclude
+        language: system
+        types: [python]

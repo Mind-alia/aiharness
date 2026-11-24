@@ -1,0 +1,402 @@
+diff --git a/template/scripts/lib/statusline.py b/template/scripts/lib/statusline.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/statusline.py
+@@ -0,0 +1,194 @@
++"""Claude Code status line: show the session model and quota, and log a usage record for the console.
++
++Claude Code runs `statusline.sh`, which execs this module with the session JSON on stdin. The output
++is one short line; a compact record goes to $WSC_HOME/claude-statusline.jsonl (default
++~/.workspace-console) when rate limits are present. Exit code is always 0.
++
++Public API: main() -> 0, install(settings, command, replace=False) -> 'ajouté' | 'identique' |
++'conservé' | 'remplacé' (raises ValueError on an unreadable settings file, which is never written).
++"""
++import datetime
++import json
++import os
++import stat
++import sys
++import tempfile
++
++
++MAX_INPUT_BYTES = 262144
++MAX_FILE_BYTES = 65536
++FILE_NAME = 'claude-statusline.jsonl'
++DEFAULT_LABEL = 'Claude'
++WINDOWS = (('five_hour', '5 h'), ('seven_day', 'semaine'))
++LABEL_MAX = 60
++UTC = datetime.timezone.utc
++
++
++def main():
++    try:
++        print(render(sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)))
++    except Exception:
++        print(DEFAULT_LABEL)
++    return 0
++
++
++def render(raw):
++    """Return the status line for the raw session JSON, and log a record when rate limits are present."""
++    data = parse(raw)
++    if data is None:
++        return DEFAULT_LABEL
++    label = model_label(data.get('model'))
++    limits = data.get('rate_limits')
++    if not isinstance(limits, dict):
++        return label
++    windows = {key: window(limits.get(key)) for key, _ in WINDOWS}
++    append_record(windows)
++    text = label
++    for key, name in WINDOWS:
++        if windows[key] is not None:
++            text += ' · {} : {} %'.format(name, int(windows[key]['used_percentage'] + 0.5))
++    return text
++
++
++def parse(raw):
++    if len(raw) > MAX_INPUT_BYTES:
++        return None
++    try:
++        data = json.loads(raw.decode('utf-8'))
++    except ValueError:
++        return None
++    return data if isinstance(data, dict) else None
++
++
++def model_label(model):
++    if not isinstance(model, dict):
++        return DEFAULT_LABEL
++    for key in ('display_name', 'id'):
++        value = model.get(key)
++        if isinstance(value, str):
++            cleaned = ''.join(char for char in value if 0x20 <= ord(char) <= 0x7e)[:LABEL_MAX]
++            if cleaned:
++                return cleaned
++    return DEFAULT_LABEL
++
++
++def is_number(value):
++    return isinstance(value, (int, float)) and not isinstance(value, bool)
++
++
++def window(value):
++    """Return {'used_percentage', 'resets_at'} for a valid window, None otherwise."""
++    if not isinstance(value, dict):
++        return None
++    used = value.get('used_percentage')
++    resets = utc_stamp(value.get('resets_at'))
++    if not is_number(used) or not 0 <= used <= 100 or resets is None:
++        return None
++    return {'used_percentage': used, 'resets_at': resets}
++
++
++def utc_stamp(value):
++    """Epoch seconds or timezone-aware ISO 8601 string as AAAA-MM-JJTHH:MM:SS.mmmZ, None if invalid."""
++    try:
++        if is_number(value) and value > 0:
++            moment = datetime.datetime.fromtimestamp(value, UTC)
++        elif isinstance(value, str):
++            moment = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
++            if moment.tzinfo is None:
++                return None
++            moment = moment.astimezone(UTC)
++        else:
++            return None
++    except (OverflowError, OSError, ValueError):
++        return None
++    return format_stamp(moment)
++
++
++def format_stamp(moment):
++    return moment.strftime('%Y-%m-%dT%H:%M:%S') + '.{:03d}Z'.format(moment.microsecond // 1000)
++
++
++def append_record(windows):
++    record = {
++        'timestamp': format_stamp(datetime.datetime.now(UTC)),
++        'five_hour': windows['five_hour'],
++        'seven_day': windows['seven_day'],
++    }
++    line = (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
++    try:
++        folder = os.environ.get('WSC_HOME') or os.path.join(os.path.expanduser('~'), '.workspace-console')
++        os.makedirs(folder, mode=0o700, exist_ok=True)
++        path = os.path.join(folder, FILE_NAME)
++        fd = open_log(path)
++        if fd is None:
++            return
++        if os.fstat(fd).st_size + len(line) > MAX_FILE_BYTES:
++            os.close(fd)
++            os.replace(path, path + '.1')
++            fd = open_log(path)
++            if fd is None:
++                return
++        with os.fdopen(fd, 'ab') as handle:
++            handle.write(line)
++    except OSError:
++        pass
++
++
++def open_log(path):
++    """Descriptor of a regular log file opened for append, None if the path is not one."""
++    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
++    fd = os.open(path, flags, 0o600)
++    if stat.S_ISREG(os.fstat(fd).st_mode):
++        return fd
++    os.close(fd)
++    return None
++
++
++def install(settings, command, replace=False):
++    """Set statusLine to the command in a Claude Code settings file, keeping other keys."""
++    wanted = {'type': 'command', 'command': command}
++    if not os.path.exists(settings):
++        write_settings(settings, {'statusLine': wanted})
++        return 'ajouté'
++    data = read_settings(settings)
++    if data.get('statusLine') == wanted:
++        return 'identique'
++    if 'statusLine' in data and not replace:
++        return 'conservé'
++    status = 'remplacé' if 'statusLine' in data else 'ajouté'
++    data['statusLine'] = wanted
++    write_settings(settings, data)
++    return status
++
++
++def read_settings(settings):
++    try:
++        with open(settings, encoding='utf-8') as handle:
++            data = json.load(handle)
++    except (OSError, ValueError) as exc:
++        raise ValueError('réglages illisibles : ' + str(exc)) from exc
++    if not isinstance(data, dict):
++        raise ValueError('réglages illisibles : objet JSON attendu')
++    return data
++
++
++def write_settings(settings, data):
++    """Replace the settings file atomically, keeping its permissions (0644 for a new file)."""
++    folder = os.path.dirname(os.path.abspath(settings))
++    os.makedirs(folder, exist_ok=True)
++    mode = stat.S_IMODE(os.stat(settings).st_mode) if os.path.exists(settings) else 0o644
++    fd, temp = tempfile.mkstemp(dir=folder, prefix='.statusline-', suffix='.tmp')
++    try:
++        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
++            json.dump(data, handle, indent=2, ensure_ascii=False)
++            handle.write('\n')
++        os.chmod(temp, mode)
++        os.replace(temp, settings)
++    except BaseException:
++        if os.path.exists(temp):
++            os.remove(temp)
++        raise
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/template/scripts/statusline.sh b/template/scripts/statusline.sh
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/statusline.sh
+@@ -0,0 +1,3 @@
++#!/bin/sh
++# Barre d'état Claude Code : exécute lib/statusline.py à côté de ce script (voir ce module).
++exec python3 "$(dirname -- "$0")/lib/statusline.py"
+diff --git a/tests/test_statusline.py b/tests/test_statusline.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_statusline.py
+@@ -0,0 +1,184 @@
++import json
++import os
++from pathlib import Path
++import re
++import subprocess
++import sys
++import tempfile
++import unittest
++from unittest import mock
++
++
++ROOT = Path(__file__).resolve().parents[1]
++LIB = ROOT / 'template/scripts/lib'
++MODULE = LIB / 'statusline.py'
++SHELL = ROOT / 'template/scripts/statusline.sh'
++sys.path.insert(0, str(LIB))
++
++import statusline  # noqa: E402
++
++SESSION = {
++    'model': {'display_name': 'Opus', 'id': 'claude-opus-5-5'},
++    'session_id': 'secret-session',
++    'transcript_path': '/private/transcript.jsonl',
++    'rate_limits': {
++        'five_hour': {'used_percentage': 23, 'resets_at': 1893459600},
++        'seven_day': {'used_percentage': 41, 'resets_at': '2030-01-02T00:00:00Z'},
++    },
++}
++STAMP = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
++
++
++class StatuslineTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.home = Path(self.tmp.name) / 'console'
++        patch = mock.patch.dict(os.environ, {'WSC_HOME': str(self.home)})
++        patch.start()
++        self.addCleanup(patch.stop)
++        self.log = self.home / statusline.FILE_NAME
++
++    def run_module(self, raw, command=None):
++        command = command or [sys.executable, str(MODULE)]
++        result = subprocess.run(command, input=raw, stdout=subprocess.PIPE, env=os.environ.copy())
++        self.assertEqual(result.returncode, 0)
++        return result.stdout.decode('utf-8')
++
++    def send(self, data):
++        raw = data if isinstance(data, bytes) else json.dumps(data).encode('utf-8')
++        return self.run_module(raw).rstrip('\n')
++
++    def records(self):
++        return [json.loads(line) for line in self.log.read_text(encoding='utf-8').splitlines()]
++
++    def test_sample_prints_line_and_logs_compact_record(self):
++        self.assertEqual(self.send(SESSION), 'Opus · 5 h : 23 % · semaine : 41 %')
++        self.assertEqual(self.log.stat().st_mode & 0o777, 0o600)
++        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
++        record, = self.records()
++        self.assertEqual(set(record), {'timestamp', 'five_hour', 'seven_day'})
++        self.assertRegex(record['timestamp'], STAMP)
++        self.assertEqual(record['five_hour'], {'used_percentage': 23, 'resets_at': '2030-01-01T01:00:00.000Z'})
++        self.assertEqual(record['seven_day'], {'used_percentage': 41, 'resets_at': '2030-01-02T00:00:00.000Z'})
++        self.assertNotIn('secret-session', self.log.read_text(encoding='utf-8'))
++
++    def test_shell_wrapper_gives_same_output(self):
++        output = self.run_module(json.dumps(SESSION).encode('utf-8'), ['sh', str(SHELL)])
++        self.assertEqual(output.rstrip('\n'), 'Opus · 5 h : 23 % · semaine : 41 %')
++        self.assertEqual(len(self.records()), 1)
++
++    def test_invalid_input_prints_default_and_writes_nothing(self):
++        for raw in (b'', b'[1, 2]', b'{broken', b'\xff\xfe', b'{"x": "' + b'a' * 300000 + b'"}'):
++            self.assertEqual(self.run_module(raw).rstrip('\n'), 'Claude')
++        self.assertFalse(self.log.exists())
++
++    def test_missing_rate_limits_prints_label_only(self):
++        self.assertEqual(self.send({'model': {'display_name': 'Opus'}}), 'Opus')
++        self.assertEqual(self.send({'model': {'display_name': 'Opus'}, 'rate_limits': []}), 'Opus')
++        self.assertFalse(self.log.exists())
++
++    def test_label_uses_id_and_keeps_printable_ascii_only(self):
++        self.assertEqual(self.send({'model': {'display_name': 5, 'id': 'sonnet'}}), 'sonnet')
++        self.assertEqual(self.send({'model': {'display_name': 'Opusé 5'}}), 'Opus 5')
++        self.assertEqual(self.send({'model': {'display_name': 'é'}}), 'Claude')
++        self.assertEqual(self.send({'model': {'display_name': 'x' * 100}}), 'x' * 60)
++
++    def test_invalid_windows_become_null_but_record_is_written(self):
++        data = {'rate_limits': {
++            'five_hour': {'used_percentage': 101, 'resets_at': 1893459600},
++            'seven_day': {'used_percentage': True, 'resets_at': 1893459600},
++        }}
++        self.assertEqual(self.send(data), 'Claude')
++        record, = self.records()
++        self.assertIsNone(record['five_hour'])
++        self.assertIsNone(record['seven_day'])
++
++    def test_naive_date_and_boolean_reset_are_invalid(self):
++        self.assertIsNone(statusline.utc_stamp('2030-01-02T00:00:00'))
++        self.assertIsNone(statusline.utc_stamp(True))
++        self.assertIsNone(statusline.utc_stamp(0))
++        self.assertIsNone(statusline.utc_stamp(float('nan')))
++        self.assertIsNone(statusline.utc_stamp(float('inf')))
++
++    def test_offset_dates_are_normalised_to_utc(self):
++        self.assertEqual(statusline.utc_stamp('2030-01-02T01:00:00+01:00'), '2030-01-02T00:00:00.000Z')
++        self.assertEqual(statusline.utc_stamp('2030-01-02T00:00:00.250Z'), '2030-01-02T00:00:00.250Z')
++
++    def test_percentages_are_kept_and_rounded_only_in_display(self):
++        data = {'model': {'display_name': 'Opus'}, 'rate_limits': {
++            'five_hour': {'used_percentage': 41.4, 'resets_at': 1893459600},
++            'seven_day': {'used_percentage': 0, 'resets_at': 1893459600},
++        }}
++        self.assertEqual(self.send(data), 'Opus · 5 h : 41 % · semaine : 0 %')
++        self.assertEqual(self.records()[0]['five_hour']['used_percentage'], 41.4)
++
++    def test_full_file_is_archived_before_append(self):
++        self.home.mkdir(mode=0o700)
++        self.log.write_bytes(b'x' * statusline.MAX_FILE_BYTES)
++        self.send(SESSION)
++        archive = self.home / (statusline.FILE_NAME + '.1')
++        self.assertEqual(archive.stat().st_size, statusline.MAX_FILE_BYTES)
++        self.assertEqual(len(self.records()), 1)
++
++    def test_symbolic_link_is_never_followed(self):
++        self.home.mkdir(mode=0o700)
++        target = Path(self.tmp.name) / 'target.txt'
++        target.write_text('intact', encoding='utf-8')
++        self.log.symlink_to(target)
++        self.assertEqual(self.send(SESSION), 'Opus · 5 h : 23 % · semaine : 41 %')
++        self.assertEqual(target.read_text(encoding='utf-8'), 'intact')
++
++    def test_directory_in_place_of_log_is_ignored(self):
++        self.log.mkdir(parents=True)
++        self.assertEqual(self.send(SESSION), 'Opus · 5 h : 23 % · semaine : 41 %')
++        self.assertTrue(self.log.is_dir())
++
++
++class InstallTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.settings = Path(self.tmp.name) / 'nested' / 'settings.json'
++        self.command = '/x/statusline.sh'
++        self.wanted = {'type': 'command', 'command': self.command}
++
++    def write(self, text):
++        self.settings.parent.mkdir(parents=True, exist_ok=True)
++        self.settings.write_text(text, encoding='utf-8')
++
++    def read(self):
++        return json.loads(self.settings.read_text(encoding='utf-8'))
++
++    def test_absent_file_is_created_with_parents(self):
++        self.assertEqual(statusline.install(str(self.settings), self.command), 'ajouté')
++        self.assertEqual(self.read(), {'statusLine': self.wanted})
++
++    def test_same_command_is_identical_without_write(self):
++        self.write(json.dumps({'statusLine': self.wanted}))
++        before = self.settings.stat().st_mtime_ns
++        self.assertEqual(statusline.install(str(self.settings), self.command), 'identique')
++        self.assertEqual(self.settings.stat().st_mtime_ns, before)
++
++    def test_other_status_line_is_kept_unless_replace(self):
++        self.write(json.dumps({'statusLine': {'type': 'command', 'command': 'other'}, 'theme': 'dark'}))
++        self.assertEqual(statusline.install(str(self.settings), self.command), 'conservé')
++        self.assertEqual(self.read()['statusLine']['command'], 'other')
++        self.assertEqual(statusline.install(str(self.settings), self.command, replace=True), 'remplacé')
++        self.assertEqual(self.read(), {'statusLine': self.wanted, 'theme': 'dark'})
++
++    def test_missing_key_is_added_and_other_keys_kept(self):
++        self.write(json.dumps({'permissions': {'allow': ['Bash']}}))
++        self.assertEqual(statusline.install(str(self.settings), self.command), 'ajouté')
++        self.assertEqual(self.read(), {'permissions': {'allow': ['Bash']}, 'statusLine': self.wanted})
++
++    def test_invalid_settings_raise_and_are_never_written(self):
++        for text in ('{broken', '[]'):
++            self.write(text)
++            with self.assertRaises(ValueError):
++                statusline.install(str(self.settings), self.command, replace=True)
++            self.assertEqual(self.settings.read_text(encoding='utf-8'), text)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

@@ -1,0 +1,61 @@
+{
+  "note": "Les noms, pingouins et pièces de cette équipe sont provisoires, à choisir par le propriétaire.",
+  "membres": [
+    {
+      "nom": "Bric",
+      "pingouin": "bric",
+      "piece": "atelier",
+      "executant": "claude-sonnet",
+      "role": "écrit le code d'après une fiche",
+      "type": "code"
+    },
+    {
+      "nom": "Crash",
+      "pingouin": "crash",
+      "piece": "labo",
+      "executant": "claude-haiku",
+      "role": "écrit les tests et cherche à casser le code (casseur)",
+      "type": "test"
+    },
+    {
+      "nom": "Garde",
+      "pingouin": "garde",
+      "piece": "poste de garde",
+      "executant": "claude-sonnet",
+      "role": "relit la sécurité",
+      "type": "security"
+    },
+    {
+      "nom": "Fiole",
+      "pingouin": "fiole",
+      "piece": "labo",
+      "executant": "antigravity",
+      "role": "mène les essais scientifiques et les mesures",
+      "type": "exploration"
+    },
+    {
+      "nom": "Plume",
+      "pingouin": "plume",
+      "piece": "bibliothèque",
+      "executant": "claude-haiku",
+      "role": "écrit la documentation",
+      "type": "docs"
+    },
+    {
+      "nom": "Loupe",
+      "pingouin": "loupe",
+      "piece": "salle de relecture",
+      "executant": "codex",
+      "role": "relit les diffs importants",
+      "type": "exploration"
+    },
+    {
+      "nom": "Atlas",
+      "pingouin": "atlas",
+      "piece": "salle des cartes",
+      "executant": "antigravity",
+      "role": "explore le code et les sources",
+      "type": "exploration"
+    }
+  ]
+}

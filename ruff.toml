@@ -1,0 +1,35 @@
+# ruff configuration of the Workspace IA kit (version pinned in the Makefile: ruff 0.17.2).
+# The kit is not an installable package and has no runtime dependency: there is deliberately no pyproject.toml,
+# because the circuit's dependency step would try `pip install .` on it. Interpreter: .python-version (3.14).
+# Syntax target one version below the runtime: keeps `except (A, B):` and other forms every reader knows.
+target-version = "py313"
+line-length = 140
+# scripts/lib and scripts/connections.py are byte-for-byte mirrors of template/scripts (tests/test_self_hosting.py);
+# the reference diffs of the bench replay old commits and must stay as recorded.
+extend-exclude = [".workspace", "scripts/lib", "scripts/connections.py", "tools/campaign/etalons"]
+
+[format]
+quote-style = "preserve"
+
+[lint]
+# E4/E7/E9 and F: real errors; I: import order; B: likely bugs; C901: complexity; UP: modern syntax;
+# N: PEP 8 names; D100: every module says what it is for; PLR0913/PLR0915: at most 5 parameters and 50 statements
+# per function (T96, 26/10). Existing offenders carry `# noqa` until they are split (T76); a new one is refused.
+select = ["E4", "E7", "E9", "F", "I", "B", "C901", "UP", "N", "D100", "PLR0913", "PLR0915"]
+# Kept on purpose: printf-style formatting and explicit stdout/stderr pipes (house style); imports after a
+# `sys.path` insertion (how scripts and tests reach template/scripts/lib); `raise ... from` (the CLI prints its own
+# French message instead of the chained cause).
+# N818: the kit's control-flow exceptions (Stop, Usage, Quota, _Refuse...) are not errors and keep their names.
+ignore = ["UP022", "UP031", "E402", "B904", "N818"]
+
+[lint.per-file-ignores]
+# A test module is named after what it tests (tests/test_<module>.py); the header is optional there.
+"tests/*" = ["D100"]
+
+[lint.pylint]
+max-args = 5
+max-statements = 50
+
+[lint.mccabe]
+# Functions above this threshold carry `# noqa: C901` until T76 splits them; a new one is refused. Never raise it.
+max-complexity = 10

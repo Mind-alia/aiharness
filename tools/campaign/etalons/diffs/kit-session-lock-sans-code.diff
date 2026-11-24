@@ -1,0 +1,248 @@
+diff --git a/tests/test_events.py b/tests/test_events.py
+--- a/tests/test_events.py
++++ b/tests/test_events.py
+@@ -38,7 +38,8 @@
+     def test_kinds_are_the_agreed_vocabulary(self):
+         self.assertEqual(events.KINDS, (
+             'prepared', 'delegate_started', 'attempt_started', 'attempt_finished', 'verify',
+-            'acceptance', 'outcome', 'merged', 'closed', 'quota'))
++            'acceptance', 'outcome', 'merged', 'closed', 'quota', 'orchestrator_claimed', 'orchestrator_released',
++            'selfcheck'))
+ 
+     def test_record_appends_sorted_json_lines_in_utc(self):
+         events.record(self.root, 'demo', 'attempt_started', {'z': 1, 'attempt': 1, 'text': 'é'})
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_orchestrator.py
+@@ -0,0 +1,230 @@
++import json
++import os
++from pathlib import Path
++import shutil
++import stat
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++BASH = shutil.which('bash')
++
++
++def run(root, env, *args):
++    return subprocess.run([BASH, str(root / 'scripts/orchestrator.sh')] + list(args), env=env,
++                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                          universal_newlines=True, encoding='utf-8')
++
++
++class OrchestratorTests(unittest.TestCase):
++
++    def setUp(self):
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        self.root = Path(tmp.name) / 'project'
++        (self.root / 'scripts/lib').mkdir(parents=True)
++        shutil.copytree(ROOT / 'template/scripts/lib', self.root / 'scripts/lib', dirs_exist_ok=True,
++                        ignore=shutil.ignore_patterns('__pycache__'))
++        shutil.copy(ROOT / 'template/scripts/orchestrator.sh', self.root / 'scripts/orchestrator.sh')
++        self.bin = Path(tmp.name) / 'bin'
++        self.bin.mkdir()
++        self.fake_docker('printf "workspace-sandbox-a\\nworkspace-sandbox-b\\n"')
++        self.env = self.make_env(self.bin)
++        self.lock = self.root / '.workspace/orchestrator.json'
++
++    def make_env(self, *path_dirs):
++        env = dict(os.environ)
++        env['PATH'] = os.pathsep.join(str(item) for item in path_dirs)
++        return env
++
++    def fake_docker(self, body):
++        script = self.bin / 'docker'
++        script.write_text('#!/bin/sh\n' + body + '\n')
++        script.chmod(0o755)
++        # python3 and dirname are what orchestrator.sh needs; ps is deliberately left out unless faked.
++        for name in ('python3', 'dirname'):
++            target = self.bin / name
++            if not target.exists():
++                target.symlink_to(shutil.which(name))
++
++    def fake_ps(self, listing):
++        # PATH holds only the fake tools: no `cat`, so the fake prints the file with shell builtins.
++        script = self.bin / 'ps'
++        script.write_text('#!/bin/sh\nwhile IFS= read -r line; do echo "$line"; done < "%s"\n' % listing)
++        script.chmod(0o755)
++
++    def no_docker_env(self):
++        empty = self.bin.parent / 'nodocker'
++        empty.mkdir(exist_ok=True)
++        for name in ('python3', 'dirname'):
++            if not (empty / name).exists():
++                (empty / name).symlink_to(shutil.which(name))
++        return self.make_env(empty), empty
++
++    def events(self):
++        path = self.root / '.workspace/events.jsonl'
++        return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else []
++
++    def status_lines(self, env=None):
++        done = run(self.root, env or self.env, 'status')
++        self.assertEqual(done.returncode, 0, done.stderr)
++        return done.stdout.splitlines()
++
++    def test_claim_status_refusal_force_release_cycle(self):
++        done = run(self.root, self.env, 'claim', '--session', 'nuit', '--model', 'opus', '--pid', str(os.getpid()))
++        self.assertEqual(done.returncode, 0, done.stderr)
++        data = json.loads(self.lock.read_text(encoding='utf-8'))
++        self.assertEqual(sorted(data), ['model', 'pid', 'repos', 'session', 'started_at'])
++        self.assertEqual((data['session'], data['model'], data['pid']), ('nuit', 'opus', os.getpid()))
++        self.assertEqual(data['repos'], [str(self.root)])
++        self.assertRegex(data['started_at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
++
++        first = self.status_lines()[0]
++        self.assertEqual(first, 'verrou : nuit (opus) depuis %s, pid %d (vivant)' % (data['started_at'], os.getpid()))
++
++        before = self.lock.read_text(encoding='utf-8')
++        refused = run(self.root, self.env, 'claim', '--session', 'jour')
++        self.assertEqual(refused.returncode, 3)
++        self.assertIn('nuit', refused.stderr)
++        self.assertIn('--force', refused.stderr)
++        self.assertEqual(self.lock.read_text(encoding='utf-8'), before)
++        self.assertEqual(len(self.events()), 1)
++
++        forced = run(self.root, self.env, 'claim', '--force', '--session', 'jour', '--repos', 'a, b,,c')
++        self.assertEqual(forced.returncode, 0, forced.stderr)
++        data = json.loads(self.lock.read_text(encoding='utf-8'))
++        self.assertEqual((data['session'], data['model'], data['repos']), ('jour', 'inconnu', ['a', 'b', 'c']))
++
++        released = run(self.root, self.env, 'release')
++        self.assertEqual(released.returncode, 0, released.stderr)
++        self.assertFalse(self.lock.exists())
++        self.assertEqual(self.status_lines()[0], 'verrou : aucun')
++
++        self.assertEqual([(item['task_id'], item['event'], item['detail']) for item in self.events()], [
++            ('orchestrator', 'orchestrator_claimed', {'session': 'nuit', 'model': 'opus', 'pid': os.getpid()}),
++            ('orchestrator', 'orchestrator_claimed', {'session': 'jour', 'model': 'inconnu', 'pid': data['pid']}),
++            ('orchestrator', 'orchestrator_released', {'session': 'jour'})])
++
++    def test_claim_defaults_and_file_mode(self):
++        done = run(self.root, self.env, 'claim')
++        self.assertEqual(done.returncode, 0, done.stderr)
++        data = json.loads(self.lock.read_text(encoding='utf-8'))
++        self.assertEqual(data['pid'], os.getpid())
++        self.assertTrue(data['session'].endswith('-%d' % os.getpid()), data['session'])
++        self.assertEqual(data['model'], 'inconnu')
++        self.assertEqual(stat.S_IMODE(self.lock.stat().st_mode), 0o600)
++        self.assertEqual(stat.S_IMODE(self.lock.parent.stat().st_mode), 0o700)
++        self.assertEqual([path.name for path in self.lock.parent.iterdir() if path.name.endswith('.tmp')], [])
++
++    def test_release_without_lock_is_silent_for_the_journal(self):
++        done = run(self.root, self.env, 'release')
++        self.assertEqual(done.returncode, 0)
++        self.assertIn('aucun verrou', done.stdout)
++        self.assertEqual(self.events(), [])
++
++    def test_symlinks_are_refused(self):
++        outside = self.root.parent / 'outside.json'
++        outside.write_text('{}')
++        (self.root / '.workspace').mkdir()
++        self.lock.symlink_to(outside)
++        for command in (['release'], ['claim', '--force']):
++            done = run(self.root, self.env, *command)
++            self.assertNotEqual(done.returncode, 0, command)
++            self.assertIn('symbolique', done.stderr)
++        self.assertEqual(outside.read_text(), '{}')
++        self.lock.unlink()
++        elsewhere = self.root.parent / 'elsewhere'
++        elsewhere.mkdir()
++        (self.root / '.workspace').rmdir()
++        (self.root / '.workspace').symlink_to(elsewhere)
++        self.assertNotEqual(run(self.root, self.env, 'claim').returncode, 0)
++        self.assertEqual(list(elsewhere.iterdir()), [])
++
++    def test_status_reports_dead_pid_and_unreadable_lock(self):
++        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
++        dead.wait()
++        run(self.root, self.env, 'claim', '--session', 's', '--pid', str(dead.pid))
++        self.assertTrue(self.status_lines()[0].endswith('(terminé)'))
++        self.lock.write_text('pas du json')
++        self.assertEqual(self.status_lines()[0], 'verrou : illisible')
++
++    def test_status_lists_active_tasks_and_tolerates_unreadable_state(self):
++        tasks = self.root / '.workspace/orchestration/tasks'
++        for name, content in [('a-run', '{"status": "running"}'), ('b-done', '{"status": "merged"}'),
++                              ('c-conflict', '{"status": "merge_conflict"}'), ('d-bad', '{oups'),
++                              ('e-prep', '{"status": "prepared"}'), ('f-fail', '{"status": "integration_failed"}'),
++                              ('g-list', '[1]')]:
++            (tasks / name).mkdir(parents=True)
++            (tasks / name / 'state.json').write_text(content)
++        lines = self.status_lines()
++        self.assertEqual([line for line in lines if line.startswith('tâche')], [
++            'tâche active : a-run (running)', 'tâche active : c-conflict (merge_conflict)',
++            'tâche illisible : d-bad', 'tâche active : e-prep (prepared)',
++            'tâche active : f-fail (integration_failed)', 'tâche illisible : g-list'])
++        self.assertNotIn('tâches actives : aucune', lines)
++
++    def test_status_without_tasks(self):
++        lines = self.status_lines()
++        self.assertIn('tâches actives : aucune', lines)
++        self.assertIn('verrou : aucun', lines)
++
++    def test_status_lists_containers_from_docker(self):
++        lines = self.status_lines()
++        self.assertIn('conteneur : workspace-sandbox-a', lines)
++        self.assertIn('conteneur : workspace-sandbox-b', lines)
++        self.fake_docker('exit 0')
++        self.assertIn('conteneurs : aucun', self.status_lines())
++
++    def test_status_without_docker_or_with_failing_docker(self):
++        env, _ = self.no_docker_env()
++        lines = self.status_lines(env)
++        self.assertIn('conteneurs : docker indisponible', lines)
++        self.fake_docker('echo boom >&2; exit 1')
++        self.assertIn('conteneurs : docker indisponible', self.status_lines())
++
++    def test_status_filters_processes_from_ps(self):
++        listing = self.bin.parent / 'ps.txt'
++        long_command = 'claude -p ' + 'x' * 400
++        listing.write_text('\n'.join([
++            '  101 /usr/bin/python3 scripts/lib/campaign.py --go',
++            '  102 vim notes.md',
++            '  103 codex exec "tâche"',
++            '  %d codex mon parent' % os.getpid(),
++            '  104 ' + long_command,
++            '  105 node claude -p "x"']) + '\n')
++        self.fake_ps(listing)
++        processes = [line for line in self.status_lines() if line.startswith('processus')]
++        self.assertEqual(processes[:2], ['processus : 101 /usr/bin/python3 scripts/lib/campaign.py --go',
++                                         'processus : 103 codex exec "tâche"'])
++        self.assertEqual(processes[2], 'processus : 104 ' + long_command[:160])
++        self.assertEqual(processes[3], 'processus : 105 node claude -p "x"')
++        self.assertEqual(len(processes), 4)
++
++    def test_status_without_matching_process(self):
++        listing = self.bin.parent / 'ps.txt'
++        listing.write_text('  7 vim notes.md\n')
++        self.fake_ps(listing)
++        self.assertIn('processus : aucun', self.status_lines())
++
++    @unittest.skipUnless(os.path.isdir('/proc/self'), 'pas de /proc')
++    def test_status_reads_proc_when_ps_is_absent(self):
++        env, _ = self.no_docker_env()
++        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)', 'campaign.py'])
++        self.addCleanup(child.wait)
++        self.addCleanup(child.kill)
++        lines = self.status_lines(env)
++        self.assertTrue(any(line.startswith('processus : %d ' % child.pid) and 'campaign.py' in line
++                            for line in lines), lines)
++
++    def test_usage(self):
++        for args in ([], ['inconnue'], ['status', 'extra']):
++            done = run(self.root, self.env, *args)
++            self.assertEqual(done.returncode, 64, args)
++            self.assertIn('usage', done.stderr)
++        self.assertFalse(self.lock.exists())
++
++
++if __name__ == '__main__':
++    unittest.main()

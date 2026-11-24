@@ -1,0 +1,258 @@
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+# Keep fixtures in the repository: system temporary directories may be sandboxed.
+TEST_TMP = ROOT / '.workspace/tmp-tests'
+TEST_TMP.mkdir(parents=True, exist_ok=True)
+MODULE = ROOT / 'template/scripts/lib/team_agents.py'
+SLUGS = ['atlas', 'bric', 'crash', 'fiole', 'garde', 'loupe', 'plume']
+MODELS = {'bric': 'sonnet', 'crash': 'haiku', 'garde': 'sonnet', 'fiole': 'haiku', 'plume': 'haiku', 'loupe': 'haiku', 'atlas': 'haiku'}
+CODE_TOOLS = 'Read, Edit, Write, Bash, Grep, Glob'
+RELAY_TOOLS = 'Read, Bash'
+TOOLS = {
+    'bric': CODE_TOOLS,
+    'crash': CODE_TOOLS,
+    'garde': 'Read, Grep, Glob',
+    'fiole': RELAY_TOOLS,
+    'plume': 'Read, Edit, Write, Grep, Glob',
+    'loupe': RELAY_TOOLS,
+    'atlas': RELAY_TOOLS,
+}
+PLUME_TEXT = '\n'.join(
+    [
+        '---',
+        'name: plume',
+        'description: "Plume : écrit la documentation (exécutant claude-haiku)"',
+        'model: haiku',
+        'tools: Read, Edit, Write, Grep, Glob',
+        '---',
+        '<!-- Généré par workspace.py team-agents depuis team.json ; ne pas modifier à la main, relancer la commande. -->',
+        '',
+        "Tu es Plume, membre de l'équipe du projet : écrit la documentation.",
+        "Lis d'abord la fiche de la tâche que l'orchestrateur te confie (`.workspace/tasks/<id>.md`) ; ne modifie que les fichiers de son périmètre `allowed`.",
+        'Ne touche jamais `scripts/`, `project.profile` ni `.workspace/` ; les règles du projet sont dans `AGENTS.md`.',
+        'Termine par un compte rendu court : fichiers modifiés, vérification lancée, doutes.',
+        '',
+    ]
+)
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location('team_agents', MODULE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def agent_path(project, slug):
+    return project / '.claude/agents' / (slug + '.md')
+
+
+def frontmatter_value(text, key):
+    for line in text.splitlines():
+        if line.startswith(key + ': '):
+            return line[len(key) + 2 :]
+    raise AssertionError('clé absente : ' + key)
+
+
+class TeamAgentsTests(unittest.TestCase):
+    def setUp(self):
+        self.team_agents = load_module()
+        TEST_TMP.mkdir(parents=True, exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(dir=TEST_TMP))
+        self.project = self.work / 'projet'
+        self.project.mkdir()
+        shutil.copy(ROOT / 'template/team.json', self.project / 'team.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def write_team(self, members):
+        data = {'membres': members}
+        (self.project / 'team.json').write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+
+    def snapshot(self):
+        folder = self.project / '.claude/agents'
+        if not folder.is_dir():
+            return {}
+        return {path.name: path.read_bytes() for path in sorted(folder.iterdir())}
+
+    def test_generates_one_file_per_member(self):
+        result = self.team_agents.generate(self.project)
+
+        self.assertEqual(result['written'], [f'.claude/agents/{slug}.md' for slug in SLUGS])
+        self.assertEqual(result['unchanged'], [])
+        self.assertEqual(result['removed'], [])
+        self.assertEqual(sorted(p.name for p in (self.project / '.claude/agents').iterdir()), [slug + '.md' for slug in SLUGS])
+
+    def test_model_and_tools_follow_executant_and_type(self):
+        self.team_agents.generate(self.project)
+
+        for slug in SLUGS:
+            text = agent_path(self.project, slug).read_text(encoding='utf-8')
+            self.assertEqual(frontmatter_value(text, 'model'), MODELS[slug], slug)
+            self.assertEqual(frontmatter_value(text, 'tools'), TOOLS[slug], slug)
+
+    def test_plume_text_is_exact(self):
+        self.team_agents.generate(self.project)
+
+        text = agent_path(self.project, 'plume').read_text(encoding='utf-8')
+        self.assertEqual(text, PLUME_TEXT)
+
+    def test_relay_member_gets_relay_line(self):
+        self.team_agents.generate(self.project)
+
+        fiole = agent_path(self.project, 'fiole').read_text(encoding='utf-8')
+        loupe = agent_path(self.project, 'loupe').read_text(encoding='utf-8')
+        self.assertTrue(
+            fiole.endswith(
+                'Tu ne fais pas le travail toi-même : transmets la demande par '
+                '`bash scripts/gemini.sh review <consigne> <réponse>` et rends sa réponse telle quelle.\n'
+            )
+        )
+        self.assertTrue(
+            loupe.endswith(
+                'Tu ne fais pas le travail toi-même : transmets la demande par '
+                '`bash scripts/codex.sh review <consigne> <réponse>` et rends sa réponse telle quelle.\n'
+            )
+        )
+        bric = agent_path(self.project, 'bric').read_text(encoding='utf-8')
+        self.assertNotIn('codex.sh', bric)
+        self.assertNotIn('gemini.sh', bric)
+
+    def test_second_generation_writes_nothing(self):
+        self.team_agents.generate(self.project)
+        before = self.snapshot()
+
+        result = self.team_agents.generate(self.project)
+
+        self.assertEqual(result['written'], [])
+        self.assertEqual(result['removed'], [])
+        self.assertEqual(result['unchanged'], [f'.claude/agents/{slug}.md' for slug in SLUGS])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_removed_member_file_is_deleted_and_others_kept(self):
+        self.team_agents.generate(self.project)
+        members = [m for m in self.team_agents.team.load(self.project / 'team.json') if m['nom'] != 'Loupe']
+        self.write_team(members)
+        other = self.project / '.claude/agents/notes.md'
+        other.write_text('# notes écrites à la main\n', encoding='utf-8')
+
+        result = self.team_agents.generate(self.project)
+
+        self.assertEqual(result['removed'], ['.claude/agents/loupe.md'])
+        self.assertFalse(agent_path(self.project, 'loupe').exists())
+        self.assertEqual(result['written'], [])
+        self.assertEqual(other.read_text(encoding='utf-8'), '# notes écrites à la main\n')
+
+    def test_handwritten_file_is_refused_without_any_write(self):
+        folder = self.project / '.claude/agents'
+        folder.mkdir(parents=True)
+        handwritten = folder / 'garde.md'
+        handwritten.write_text('# écrit à la main\n', encoding='utf-8')
+
+        with self.assertRaises(ValueError) as caught:
+            self.team_agents.generate(self.project)
+
+        self.assertEqual(str(caught.exception), 'fichier non généré : .claude/agents/garde.md')
+        self.assertEqual(self.snapshot(), {'garde.md': '# écrit à la main\n'.encode()})
+
+    def test_slug_removes_accents_and_replaces_other_characters(self):
+        self.assertEqual(self.team_agents.slug('Élodie Ça-va !'), 'elodie-ca-va')
+        self.assertEqual(self.team_agents.slug('  Bric  '), 'bric')
+        self.assertEqual(self.team_agents.slug('Atlas_2'), 'atlas-2')
+        with self.assertRaises(ValueError):
+            self.team_agents.slug('!!!')
+        with self.assertRaises(ValueError):
+            self.team_agents.slug('   ')
+
+    def test_accented_member_name_gets_ascii_file(self):
+        members = [
+            {'nom': 'Élodie', 'pingouin': 'elodie', 'piece': 'atelier', 'executant': 'claude-haiku', 'role': 'essai', 'type': 'docs'}
+        ]
+        self.write_team(members)
+
+        result = self.team_agents.generate(self.project)
+
+        self.assertEqual(result['written'], ['.claude/agents/elodie.md'])
+        text = agent_path(self.project, 'elodie').read_text(encoding='utf-8')
+        self.assertIn('name: elodie\n', text)
+        self.assertIn('Tu es Élodie, membre', text)
+
+    def test_missing_role_uses_default_wording(self):
+        members = [{'nom': 'Bric', 'pingouin': 'bric', 'piece': 'atelier', 'executant': 'claude-sonnet', 'type': 'code'}]
+
+        text = self.team_agents.render(members[0])
+
+        self.assertIn("Tu es Bric, membre de l'équipe du projet : membre de l'équipe.\n", text)
+        self.assertIn('description: "Bric : membre de l\'équipe (exécutant claude-sonnet)"\n', text)
+
+    def test_duplicate_slug_is_refused_without_any_write(self):
+        members = [
+            {'nom': 'Bric', 'pingouin': 'bric', 'piece': 'atelier', 'executant': 'claude-sonnet', 'type': 'code'},
+            {'nom': 'bric', 'pingouin': 'bric2', 'piece': 'atelier', 'executant': 'claude-haiku', 'type': 'code'},
+        ]
+        self.write_team(members)
+
+        with self.assertRaises(ValueError) as caught:
+            self.team_agents.generate(self.project)
+
+        self.assertIn('slug en double : bric', str(caught.exception))
+        self.assertFalse((self.project / '.claude').exists())
+
+    def test_symbolic_link_is_refused(self):
+        outside = self.work / 'dehors'
+        outside.mkdir()
+        os.symlink(outside, self.project / '.claude')
+
+        with self.assertRaises(ValueError) as caught:
+            self.team_agents.generate(self.project)
+
+        self.assertIn('Lien symbolique', str(caught.exception))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_missing_registry_is_refused(self):
+        (self.project / 'team.json').unlink()
+
+        with self.assertRaises(ValueError) as caught:
+            self.team_agents.generate(self.project)
+
+        self.assertIn('team.json absent', str(caught.exception))
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(MODULE), *args], capture_output=True, text=True)
+
+    def test_command_line_prints_summary(self):
+        first = self.run_cli(str(self.project))
+        second = self.run_cli(str(self.project))
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout, 'Sous-agents : 7 écrits, 0 identiques, 0 retirés (.claude/agents)\n')
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout, 'Sous-agents : 0 écrits, 7 identiques, 0 retirés (.claude/agents)\n')
+
+    def test_command_line_reports_error_with_code_one(self):
+        (self.project / 'team.json').unlink()
+
+        result = self.run_cli(str(self.project))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('team.json absent', result.stderr)
+
+    def test_command_line_wrong_arguments_exit_64(self):
+        result = self.run_cli()
+
+        self.assertEqual(result.returncode, 64)
+        self.assertIn('usage', result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

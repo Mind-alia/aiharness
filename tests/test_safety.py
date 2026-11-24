@@ -1,0 +1,69 @@
+"""Tests unitaires de template/scripts/lib/safety.py (aucun accès réseau)."""
+
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[1] / 'template/scripts/lib'
+sys.path.insert(0, str(LIB))
+
+import safety  # noqa: E402
+
+
+class SafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+
+    def test_direct_path_is_accepted(self):
+        target = self.root / 'file.txt'
+        target.write_text('x', encoding='utf-8')
+
+        safety.check_no_symlinks(target, self.root)
+
+    def test_root_itself_is_accepted(self):
+        safety.check_no_symlinks(self.root, self.root)
+
+    def test_symlink_on_intermediate_component_is_refused(self):
+        real = self.root / 'real'
+        real.mkdir()
+        (real / 'file.txt').write_text('x', encoding='utf-8')
+        os.symlink(real, self.root / 'link')
+
+        with self.assertRaises(ValueError):
+            safety.check_no_symlinks(self.root / 'link' / 'file.txt', self.root)
+
+    def test_symlink_on_last_component_is_refused(self):
+        target = self.root / 'target.txt'
+        target.write_text('x', encoding='utf-8')
+        os.symlink(target, self.root / 'link.txt')
+
+        with self.assertRaises(ValueError):
+            safety.check_no_symlinks(self.root / 'link.txt', self.root)
+
+    def test_write_creates_file_with_mode_0600(self):
+        target = self.root / 'answer.md'
+
+        safety.write_file_secure(target, 'réponse')
+
+        self.assertEqual(target.read_text(encoding='utf-8'), 'réponse\n')
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_write_refuses_symlink_and_leaves_target_untouched(self):
+        victim = self.root / 'victim.txt'
+        victim.write_text('intact', encoding='utf-8')
+        link = self.root / 'link.md'
+        os.symlink(victim, link)
+
+        with self.assertRaises(ValueError):
+            safety.write_file_secure(link, 'écrasé')
+
+        self.assertEqual(victim.read_text(encoding='utf-8'), 'intact')
+
+
+if __name__ == '__main__':
+    unittest.main()

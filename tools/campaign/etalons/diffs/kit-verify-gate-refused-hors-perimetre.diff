@@ -1,0 +1,106 @@
+diff --git a/template/scripts/lib/prepare_task.py b/template/scripts/lib/prepare_task.py
+--- a/template/scripts/lib/prepare_task.py
++++ b/template/scripts/lib/prepare_task.py
+@@ -104,6 +104,8 @@
+ dans les fiches. Donner une à trois acceptations par tâche, chemins relatifs sans
+ .. ni .git ni .workspace. Les commandes acceptance_verify utilisent ces chemins
+ relatifs montés dans le worktree. allowed non vide. Aucun en-tête dans body.
++verify est une commande ciblée (tests des fichiers touchés), jamais la porte complète
++scripts/gate.sh : elle ne passe pas dans le conteneur et tourne à la fusion.
+ Répondre avec UNE réponse JSON, sans commentaire et sans autre champ :
+ {"tasks":[{"suffix":"", "allowed":["src/fichier"], "verify":"commande", "body":"fiche complète en français"}],
+  "acceptance":[{"task_suffix":"", "path":"tests/test_acceptation.py", "content":"test complet"}],
+diff --git a/template/scripts/lib/task.py b/template/scripts/lib/task.py
+--- a/template/scripts/lib/task.py
++++ b/template/scripts/lib/task.py
+@@ -69,6 +69,21 @@
+             raise ValueError('Chaîne invalide dans l’en-tête')
+         return value[1:-1].replace("''", "'")
+     return value
++
++
++FULL_GATE_MESSAGE = ('verify ne doit pas lancer la porte complète (scripts/gate.sh) : elle tourne à la fusion ; '
++                     'indiquer une commande ciblée, par exemple les tests des fichiers touchés, '
++                     'ou scripts/gate.sh --quick.')
++GATE_CALL = re.compile(r'(?:bash\s+|sh\s+|\./)?scripts/gate\.sh(\s.*)?')
++
++
++def runs_full_gate(command):
++    """True when a verify command chain calls scripts/gate.sh without --quick."""
++    for segment in re.split(r'&&|\|\||[;&|\n]', command):
++        match = GATE_CALL.fullmatch(segment.strip())
++        if match and '--quick' not in (match.group(1) or '').split():
++            return True
++    return False
+ 
+ 
+ def read_task(path):
+@@ -124,6 +139,8 @@
+     data['attempts'] = int(attempts)
+     if 'verify' in data and not isinstance(data['verify'], str):
+         raise ValueError('verify doit être une commande')
++    if 'verify' in data and runs_full_gate(data['verify']):
++        raise ValueError(FULL_GATE_MESSAGE)
+     for field, default in (('verify_profile', 'on'), ('verify_lint', 'on'), ('auto_retry', 'off')):
+         data.setdefault(field, default)
+         if data[field] not in ('on', 'off'):
+diff --git a/tests/test_prepare_task.py b/tests/test_prepare_task.py
+--- a/tests/test_prepare_task.py
++++ b/tests/test_prepare_task.py
+@@ -153,6 +153,15 @@
+         self.assertEqual(result.returncode, 0, result.stderr)
+         self.assertEqual(result.stdout, 'sum\n')
+ 
++    def test_prompt_warns_against_full_gate(self):
++        spec = importlib.util.spec_from_file_location('prepare_task_prompt', ROOT / 'template/scripts/lib/prepare_task.py')
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        prompt = module.prompt_for(self.root, 'Créer une fonction de somme.')
++        self.assertIn('scripts/gate.sh', prompt)
++        self.assertIn('ciblée', prompt)
++        self.assertIn('verify est une commande ciblée', prompt)
++
+     def test_install_circuit(self):
+         spec = importlib.util.spec_from_file_location('workspace_prepare_test', ROOT / 'scripts/workspace.py')
+         module = importlib.util.module_from_spec(spec)
+diff --git a/tests/test_task.py b/tests/test_task.py
+--- a/tests/test_task.py
++++ b/tests/test_task.py
+@@ -1,4 +1,5 @@
+ import importlib.util
++import json
+ from pathlib import Path
+ import tempfile
+ import unittest
+@@ -60,6 +61,25 @@
+         with self.assertRaises(ValueError):
+             self.read(base + '\nauto_retry: yes')
+ 
++    def test_verify_refuses_full_gate(self):
++        base = 'id: demo\nagent: codex\nallowed: []'
++        refused = ['bash scripts/gate.sh', 'sh scripts/gate.sh', './scripts/gate.sh',
++                   'bash scripts/gate.sh && echo done', 'echo start; sh scripts/gate.sh',
++                   'python3 -m unittest tests.test_task; ./scripts/gate.sh',
++                   'bash scripts/gate.sh extra']
++        for command in refused:
++            with self.subTest(command=command), self.assertRaisesRegex(ValueError, 'porte complète'):
++                self.read(base + '\nverify: ' + json.dumps(command))
++
++    def test_verify_accepts_targeted_commands(self):
++        base = 'id: demo\nagent: codex\nallowed: []'
++        accepted = ['bash scripts/gate.sh --quick', 'sh scripts/gate.sh --quick && echo ok',
++                    './scripts/gate.sh --quick', 'python3 -m unittest tests.test_task',
++                    'echo "scripts/gate.sh"', 'bash scripts/gate.sh.bak', 'cat scripts/gate.sh']
++        for command in accepted:
++            with self.subTest(command=command):
++                self.assertEqual(self.read(base + '\nverify: ' + json.dumps(command))['verify'], command)
++
+     def test_acceptance_paths(self):
+         base = 'id: demo\nagent: codex\nallowed: []'
+         task = self.read(base + '\nacceptance:\n  - tests/hidden.py\nacceptance_verify: python3 tests/hidden.py')
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

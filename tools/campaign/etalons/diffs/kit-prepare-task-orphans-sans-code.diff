@@ -1,0 +1,101 @@
+diff --git a/tests/test_prepare_task.py b/tests/test_prepare_task.py
+--- a/tests/test_prepare_task.py
++++ b/tests/test_prepare_task.py
+@@ -4,14 +4,26 @@
+ import os
+ from pathlib import Path
+ import shutil
++import signal
+ import subprocess
+ import sys
+ import tempfile
++import time
+ import unittest
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(ROOT / 'template/scripts/lib'))
+ from task import read_task
++
++
++def alive(pid):
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    return True
+ 
+ 
+ class PrepareTaskTests(unittest.TestCase):
+@@ -162,6 +174,70 @@
+         self.assertIn('ciblée', prompt)
+         self.assertIn('verify est une commande ciblée', prompt)
+ 
++    def start_hung_planner(self):
++        script = '#!' + sys.executable + '\nimport os, subprocess, sys, time\n'
++        script += "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
++        script += "open('pids.txt', 'w').write('%d %d' % (os.getpid(), child.pid))\n"
++        script += 'time.sleep(600)\n'
++        (self.bin / 'claude').write_text(script)
++        (self.bin / 'claude').chmod(0o700)
++        process = subprocess.Popen(['bash', 'scripts/prepare-task.sh', 'request.md', 'sum',
++                                    '--executor', 'claude-haiku'], cwd=self.root, env=self.env,
++                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++        self.addCleanup(self.stop, process)
++        return process
++
++    @staticmethod
++    def stop(process):
++        process.kill()
++        process.wait()
++        process.stdout.close()
++        process.stderr.close()
++
++    def wait_for_planner(self):
++        path = self.root / 'pids.txt'
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            pids = path.read_text().split() if path.is_file() else []
++            if len(pids) == 2:
++                pids = [int(pid) for pid in pids]
++                self.addCleanup(self.kill_quietly, pids)
++                return pids
++            time.sleep(0.05)
++        self.fail('Le faux planificateur ne démarre pas')
++
++    @staticmethod
++    def kill_quietly(pids):
++        for pid in pids:
++            try:
++                os.kill(pid, signal.SIGKILL)
++            except ProcessLookupError:
++                pass
++
++    def assert_gone(self, pids):
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline and any(alive(pid) for pid in pids):
++            time.sleep(0.05)
++        self.assertEqual([pid for pid in pids if alive(pid)], [])
++
++    def test_sigterm_stops_planner_group(self):
++        process = self.start_hung_planner()
++        pids = self.wait_for_planner()
++        process.send_signal(signal.SIGTERM)
++        _, stderr = process.communicate(timeout=10)
++        self.assertEqual(process.returncode, 130, stderr)
++        self.assertIn('Préparation interrompue.', stderr)
++        self.assert_gone(pids)
++        self.assertFalse((self.root / 'tasks').exists())
++
++    def test_sigkill_guardian_stops_planner_group(self):
++        process = self.start_hung_planner()
++        pids = self.wait_for_planner()
++        process.send_signal(signal.SIGKILL)
++        process.wait(timeout=10)
++        self.assertEqual(process.returncode, -signal.SIGKILL)
++        self.assert_gone(pids)
++
+     def test_install_circuit(self):
+         spec = importlib.util.spec_from_file_location('workspace_prepare_test', ROOT / 'scripts/workspace.py')
+         module = importlib.util.module_from_spec(spec)

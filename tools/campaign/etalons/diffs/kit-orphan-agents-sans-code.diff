@@ -1,0 +1,209 @@
+diff --git a/tests/test_delegate.py b/tests/test_delegate.py
+--- a/tests/test_delegate.py
++++ b/tests/test_delegate.py
+@@ -8,6 +8,11 @@
+ 
+ if os.environ.get('WORKSPACE_TESTS') == 'fast':
+     raise unittest.SkipTest('module lent : Git réel, sous-processus ou Docker simulé ; suite complète seulement')
++
++try:
++    from tests.test_procs import gone
++except ImportError:
++    from test_procs import gone
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ 
+@@ -1018,6 +1023,70 @@
+         self.assertEqual(self.status()['outcome'], 'interrupted')
+         self.assertNotIn(b'privatecredential', out + err)
+ 
++    def spawn_agent(self, script, attempts=1, **env):
++        """Start delegate.sh with a fake claude; return (process, main pid, background pid) once both exist."""
++        import time
++        pids = self.root.parent / 'agent-pids'
++        shutil.rmtree(pids, ignore_errors=True)
++        pids.mkdir()
++        self.write_task('claude-haiku', attempts=attempts)
++        self.executable('bin/claude', script.replace('PIDS', str(pids)))
++        proc = subprocess.Popen(['bash', str(self.root / 'scripts/delegate.sh'), str(self.task)],
++                                env=dict(self.env, **env), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
++        found = []
++        for name in ('main', 'bg'):
++            deadline = time.monotonic() + 10
++            while not (pids / name).is_file() or not (pids / name).read_text().strip():
++                self.assertLess(time.monotonic(), deadline, name + ' pid file missing')
++                time.sleep(0.02)
++            found.append(int(((pids / name).read_text())))
++            self.addCleanup(lambda pid=found[-1]: gone(pid, 0) or os.kill(pid, 9))
++        return proc, *found
++
++    def test_agent_left_in_background_does_not_block_delegation(self):
++        proc, main, background = self.spawn_agent(
++            '#!/bin/sh\necho $$ > PIDS/main\nsleep 300 &\necho $! > PIDS/bg\necho \'{"result":"answer"}\'\n')
++        proc.communicate(timeout=30)
++        self.assertEqual(proc.returncode, 0)
++        self.assertTrue(gone(background, 5))
++
++    def test_agent_processes_do_not_survive_delegate_signals(self):
++        import signal
++        script = '#!/bin/sh\necho $$ > PIDS/main\nsleep 300 &\necho $! > PIDS/bg\nwait\n'
++        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGKILL):
++            with self.subTest(signal=sig.name):
++                proc, main, background = self.spawn_agent(script)
++                proc.send_signal(sig)
++                proc.communicate(timeout=10)
++                if sig != signal.SIGKILL:
++                    self.assertEqual((proc.returncode, self.status()['outcome']), (130, 'interrupted'))
++                self.assertTrue(gone(main, 10), 'agent still running')
++                self.assertTrue(gone(background, 10), 'agent child still running')
++
++    def test_agent_timeout_ends_the_attempt_with_code_124(self):
++        import time
++        started = time.monotonic()
++        proc, main, background = self.spawn_agent(
++            '#!/bin/sh\necho $$ > PIDS/main\nsleep 300 &\necho $! > PIDS/bg\nwait\n', DELEGATE_AGENT_TIMEOUT='2')
++        proc.communicate(timeout=30)
++        self.assertLess(time.monotonic() - started, 30)
++        self.assertNotEqual(proc.returncode, 0)
++        events = [json.loads(line) for line in (self.root / '.workspace/events.jsonl').read_text().splitlines()]
++        finished = [e['detail'] for e in events if e['event'] == 'attempt_finished']
++        self.assertEqual(finished, [{'attempt': 1, 'code': 124}])
++        self.assertIn("délai de l'agent dépassé (2 s)", (self.root / '.workspace/run/delegate/demo/events').read_text())
++        self.assertTrue(gone(main, 5) and gone(background, 5))
++
++    def test_agent_timeout_variable_is_validated(self):
++        for value in ('', '0'):
++            with self.subTest(value=value):
++                self.assertEqual(self.run_delegate(env={'DELEGATE_AGENT_TIMEOUT': value}).returncode, 0)
++        for value in ('-1', 'abc', 'nan'):
++            with self.subTest(value=value):
++                result = self.run_delegate(env={'DELEGATE_AGENT_TIMEOUT': value})
++                self.assertEqual(result.returncode, 64)
++
+     def test_security_large_output(self):
+         self.write_task('claude-haiku')
+         self.executable('bin/claude', '#!/usr/bin/env python3\nprint("a" * (3 * 1024 * 1024))\n')
+diff --git a/tests/test_procs.py b/tests/test_procs.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_procs.py
+@@ -0,0 +1,118 @@
++import os
++from pathlib import Path
++import subprocess
++import sys
++import time
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'template/scripts/lib'))
++import procs
++
++GROUP = 'sleep 60 & echo $!; sleep 60'
++
++
++def running(pid):
++    """A zombie is not a survivor: an orphan may stay defunct until its reaper runs."""
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    try:
++        return Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()[0] != 'Z'
++    except OSError:
++        return True
++
++
++def gone(pid, timeout=5):
++    deadline = time.monotonic() + timeout
++    while running(pid) and time.monotonic() < deadline:
++        time.sleep(0.02)
++    return not running(pid)
++
++
++class ProcsTests(unittest.TestCase):
++    def start_group(self, script=GROUP):
++        leader = subprocess.Popen(['sh', '-c', script], stdout=subprocess.PIPE, start_new_session=True)
++        self.addCleanup(lambda: (procs.kill_group(leader.pid, 0), leader.wait(), leader.stdout.close()))
++        return leader, int(leader.stdout.readline())
++
++    def test_kill_group_on_missing_group_does_nothing(self):
++        done = subprocess.Popen(['sh', '-c', 'true'], start_new_session=True)
++        done.wait()
++        procs.kill_group(done.pid)
++        procs.kill_group(done.pid, grace=0)
++        self.assertFalse(procs.group_alive(done.pid))
++
++    def test_kill_group_never_targets_the_callers_group(self):
++        procs.kill_group(0)
++        procs.kill_group(1)
++
++    def test_group_alive_follows_the_group(self):
++        leader, _ = self.start_group()
++        self.assertTrue(procs.group_alive(leader.pid))
++        procs.kill_group(leader.pid, grace=0.2)
++        leader.wait()
++        self.assertTrue(gone(leader.pid))
++
++    def test_kill_group_empties_the_group_and_is_idempotent(self):
++        leader, background = self.start_group()
++        procs.kill_group(leader.pid, grace=0.2)
++        procs.kill_group(leader.pid, grace=0.2)
++        self.assertNotEqual(leader.wait(timeout=5), 0)
++        self.assertTrue(gone(background))
++
++    def test_kill_group_escalates_when_sigterm_is_ignored(self):
++        leader, background = self.start_group("trap '' TERM; " + GROUP)
++        procs.kill_group(leader.pid, grace=0.2)
++        self.assertEqual(leader.wait(timeout=5), -9)
++        self.assertTrue(gone(background))
++
++    def test_guardian_kills_the_group_when_its_input_closes_without_release(self):
++        leader, background = self.start_group()
++        guardian = procs.start_guardian(leader.pid)
++        guardian.stdin.close()
++        self.assertEqual(guardian.wait(timeout=10), 0)
++        leader.wait(timeout=5)
++        self.assertTrue(gone(background))
++
++    def test_guardian_has_emptied_the_group_by_the_time_it_exits(self):
++        leader, background = self.start_group()
++        guardian = procs.start_guardian(leader.pid)
++        guardian.stdin.close()
++        self.assertEqual(guardian.wait(timeout=10), 0)
++        self.assertFalse(running(background))
++
++    def test_released_guardian_leaves_the_group_alone(self):
++        leader, background = self.start_group()
++        guardian = procs.start_guardian(leader.pid)
++        procs.release_guardian(guardian)
++        self.assertEqual(guardian.returncode, 0)
++        time.sleep(0.2)
++        self.assertTrue(running(background))
++        self.assertIsNone(leader.poll())
++
++    def test_release_guardian_tolerates_a_dead_guardian(self):
++        guardian = procs.start_guardian(2 ** 22 + 12345)
++        guardian.kill()
++        guardian.wait()
++        procs.release_guardian(guardian)
++        procs.release_guardian(guardian)
++
++    def test_guardian_survives_sigkill_of_the_callers_group(self):
++        leader, background = self.start_group()
++        caller = subprocess.Popen(
++            [sys.executable, '-c',
++             'import sys, time; sys.path.insert(0, %r); import procs; '
++             'g = procs.start_guardian(%d); print(g.pid, flush=True); time.sleep(60)'
++             % (str(Path(procs.__file__).parent), leader.pid)],
++            stdout=subprocess.PIPE, start_new_session=True)
++        self.addCleanup(caller.stdout.close)
++        guardian_pid = int(caller.stdout.readline())
++        os.killpg(caller.pid, 9)
++        caller.wait()
++        self.assertTrue(gone(background, timeout=10))
++        self.assertTrue(gone(guardian_pid, timeout=10))
++
++
++if __name__ == '__main__':
++    unittest.main()

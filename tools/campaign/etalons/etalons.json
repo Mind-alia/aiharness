@@ -1,0 +1,1254 @@
+{
+  "config": "../../../.workspace/campaign-light/campagne-complet-3.json",
+  "task": "t1-quota-c3",
+  "etalons": [
+    {
+      "id": "bon-haiku-18",
+      "diff": "bon-haiku-18.diff",
+      "base": "a54698a",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "Haiku, banc e3 du 18 octobre (diff.txt de camp-t1-quota-e3-systeme-claude-haiku-1-0, deux lignes masquées par *** réparées, docs/decisions.md retiré)"
+    },
+    {
+      "id": "bon-opus-nuit-19",
+      "diff": "bon-opus-nuit-19.diff",
+      "base": "699ddf8",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "Opus, bras systeme-claude-opus de la nuit du 19 (699ddf8..73bbac3, apps/ et packages/)"
+    },
+    {
+      "id": "bon-opus-matin-19",
+      "diff": "bon-opus-matin-19.diff",
+      "base": "a66e4dd",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "Opus, bras systeme-claude-opus du banc c3 du 19 au matin (a66e4dd..f0456f8, apps/ et packages/)"
+    },
+    {
+      "id": "mauvais-triche",
+      "diff": "mauvais-triche.diff",
+      "base": "a66e4dd",
+      "expected": "reject",
+      "kind": "test qui triche",
+      "source": "fabriqué depuis bon-opus-matin-19 : projectQuota renvoie toujours insufficient_data, tests de l'agent réduits à ce bouchon"
+    },
+    {
+      "id": "mauvais-partiel",
+      "diff": "mauvais-partiel.diff",
+      "base": "a66e4dd",
+      "expected": "reject",
+      "kind": "correctif partiel",
+      "source": "fabriqué depuis bon-opus-matin-19 : resetsBeforeExhaustion toujours faux (réinitialisation ignorée)"
+    },
+    {
+      "id": "mauvais-hors-perimetre",
+      "diff": "mauvais-hors-perimetre.diff",
+      "base": "a66e4dd",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "fabriqué depuis bon-opus-matin-19 : travail juste, plus scripts/gate.sh court-circuité par exit 0"
+    },
+    {
+      "id": "kit-acceptance-selfcheck-bon",
+      "diff": "diffs/kit-acceptance-selfcheck-bon.diff",
+      "base": "35de008faa34a22b2510d7635947d2797ea51bf5",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche acceptance-selfcheck (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "acceptance-selfcheck"
+    },
+    {
+      "id": "kit-acceptance-selfcheck-sans-code",
+      "diff": "diffs/kit-acceptance-selfcheck-sans-code.diff",
+      "base": "35de008faa34a22b2510d7635947d2797ea51bf5",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche acceptance-selfcheck (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "acceptance-selfcheck"
+    },
+    {
+      "id": "kit-acceptance-selfcheck-hors-perimetre",
+      "diff": "diffs/kit-acceptance-selfcheck-hors-perimetre.diff",
+      "base": "35de008faa34a22b2510d7635947d2797ea51bf5",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche acceptance-selfcheck (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "acceptance-selfcheck"
+    },
+    {
+      "id": "kit-attack-bench-on-sandbox-change-bon",
+      "diff": "diffs/kit-attack-bench-on-sandbox-change-bon.diff",
+      "base": "0920efdde93e7dfbd494db93c4a377560c22f71e",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche attack-bench-on-sandbox-change (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "attack-bench-on-sandbox-change"
+    },
+    {
+      "id": "kit-attack-bench-on-sandbox-change-sans-code",
+      "diff": "diffs/kit-attack-bench-on-sandbox-change-sans-code.diff",
+      "base": "0920efdde93e7dfbd494db93c4a377560c22f71e",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche attack-bench-on-sandbox-change (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "attack-bench-on-sandbox-change"
+    },
+    {
+      "id": "kit-attack-bench-on-sandbox-change-hors-perimetre",
+      "diff": "diffs/kit-attack-bench-on-sandbox-change-hors-perimetre.diff",
+      "base": "0920efdde93e7dfbd494db93c4a377560c22f71e",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche attack-bench-on-sandbox-change (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "attack-bench-on-sandbox-change"
+    },
+    {
+      "id": "kit-attack-interruption-bon",
+      "diff": "diffs/kit-attack-interruption-bon.diff",
+      "base": "89488a754f3b383f503940230ffe6a224abe9699",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche attack-interruption (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "attack-interruption"
+    },
+    {
+      "id": "kit-attack-interruption-sans-code",
+      "diff": "diffs/kit-attack-interruption-sans-code.diff",
+      "base": "89488a754f3b383f503940230ffe6a224abe9699",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche attack-interruption (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "attack-interruption"
+    },
+    {
+      "id": "kit-attack-interruption-hors-perimetre",
+      "diff": "diffs/kit-attack-interruption-hors-perimetre.diff",
+      "base": "89488a754f3b383f503940230ffe6a224abe9699",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche attack-interruption (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "attack-interruption"
+    },
+    {
+      "id": "kit-breaker-agent-bon",
+      "diff": "diffs/kit-breaker-agent-bon.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche breaker-agent (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-agent"
+    },
+    {
+      "id": "kit-breaker-agent-sans-code",
+      "diff": "diffs/kit-breaker-agent-sans-code.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche breaker-agent (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-agent"
+    },
+    {
+      "id": "kit-breaker-agent-hors-perimetre",
+      "diff": "diffs/kit-breaker-agent-hors-perimetre.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche breaker-agent (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-agent"
+    },
+    {
+      "id": "kit-breaker-vitest5-bon",
+      "diff": "diffs/kit-breaker-vitest5-bon.diff",
+      "base": "d34d598111c2e338e06c5e00aee06e70fb23002c",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche breaker-vitest5 (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-vitest5"
+    },
+    {
+      "id": "kit-breaker-vitest5-sans-code",
+      "diff": "diffs/kit-breaker-vitest5-sans-code.diff",
+      "base": "d34d598111c2e338e06c5e00aee06e70fb23002c",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche breaker-vitest5 (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-vitest5"
+    },
+    {
+      "id": "kit-breaker-vitest5-hors-perimetre",
+      "diff": "diffs/kit-breaker-vitest5-hors-perimetre.diff",
+      "base": "d34d598111c2e338e06c5e00aee06e70fb23002c",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche breaker-vitest5 (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-vitest5"
+    },
+    {
+      "id": "kit-breaker-vitest5-parse-bon",
+      "diff": "diffs/kit-breaker-vitest5-parse-bon.diff",
+      "base": "fd2db20f98485d934bbeb93d187c823346379f02",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche breaker-vitest5-parse (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-vitest5-parse"
+    },
+    {
+      "id": "kit-breaker-vitest5-parse-sans-code",
+      "diff": "diffs/kit-breaker-vitest5-parse-sans-code.diff",
+      "base": "fd2db20f98485d934bbeb93d187c823346379f02",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche breaker-vitest5-parse (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-vitest5-parse"
+    },
+    {
+      "id": "kit-breaker-vitest5-parse-hors-perimetre",
+      "diff": "diffs/kit-breaker-vitest5-parse-hors-perimetre.diff",
+      "base": "fd2db20f98485d934bbeb93d187c823346379f02",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche breaker-vitest5-parse (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "breaker-vitest5-parse"
+    },
+    {
+      "id": "kit-broker-replay-bon",
+      "diff": "diffs/kit-broker-replay-bon.diff",
+      "base": "5edeef1109a53e4fb2b00e34dcae5213067e6fa0",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche broker-replay (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "broker-replay"
+    },
+    {
+      "id": "kit-broker-replay-sans-code",
+      "diff": "diffs/kit-broker-replay-sans-code.diff",
+      "base": "5edeef1109a53e4fb2b00e34dcae5213067e6fa0",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche broker-replay (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "broker-replay"
+    },
+    {
+      "id": "kit-broker-replay-hors-perimetre",
+      "diff": "diffs/kit-broker-replay-hors-perimetre.diff",
+      "base": "5edeef1109a53e4fb2b00e34dcae5213067e6fa0",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche broker-replay (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "broker-replay"
+    },
+    {
+      "id": "kit-campaign-false-quota-bon",
+      "diff": "diffs/kit-campaign-false-quota-bon.diff",
+      "base": "d34d598111c2e338e06c5e00aee06e70fb23002c",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche campaign-false-quota (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-false-quota"
+    },
+    {
+      "id": "kit-campaign-false-quota-sans-code",
+      "diff": "diffs/kit-campaign-false-quota-sans-code.diff",
+      "base": "d34d598111c2e338e06c5e00aee06e70fb23002c",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche campaign-false-quota (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-false-quota"
+    },
+    {
+      "id": "kit-campaign-false-quota-hors-perimetre",
+      "diff": "diffs/kit-campaign-false-quota-hors-perimetre.diff",
+      "base": "d34d598111c2e338e06c5e00aee06e70fb23002c",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche campaign-false-quota (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-false-quota"
+    },
+    {
+      "id": "kit-campaign-quota-scope-bon",
+      "diff": "diffs/kit-campaign-quota-scope-bon.diff",
+      "base": "452456b3ebeb1728f9dccf3628d66db05df893cc",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche campaign-quota-scope (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-quota-scope"
+    },
+    {
+      "id": "kit-campaign-quota-scope-sans-code",
+      "diff": "diffs/kit-campaign-quota-scope-sans-code.diff",
+      "base": "452456b3ebeb1728f9dccf3628d66db05df893cc",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche campaign-quota-scope (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-quota-scope"
+    },
+    {
+      "id": "kit-campaign-quota-scope-hors-perimetre",
+      "diff": "diffs/kit-campaign-quota-scope-hors-perimetre.diff",
+      "base": "452456b3ebeb1728f9dccf3628d66db05df893cc",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche campaign-quota-scope (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-quota-scope"
+    },
+    {
+      "id": "kit-campaign-worktrees-bon",
+      "diff": "diffs/kit-campaign-worktrees-bon.diff",
+      "base": "a57771ee24708d79af3c3ea4547d4e189cd20dce",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche campaign-worktrees (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-worktrees"
+    },
+    {
+      "id": "kit-campaign-worktrees-sans-code",
+      "diff": "diffs/kit-campaign-worktrees-sans-code.diff",
+      "base": "a57771ee24708d79af3c3ea4547d4e189cd20dce",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche campaign-worktrees (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-worktrees"
+    },
+    {
+      "id": "kit-campaign-worktrees-hors-perimetre",
+      "diff": "diffs/kit-campaign-worktrees-hors-perimetre.diff",
+      "base": "a57771ee24708d79af3c3ea4547d4e189cd20dce",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche campaign-worktrees (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "campaign-worktrees"
+    },
+    {
+      "id": "kit-claim-durable-pid-bon",
+      "diff": "diffs/kit-claim-durable-pid-bon.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche claim-durable-pid (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claim-durable-pid"
+    },
+    {
+      "id": "kit-claim-durable-pid-sans-code",
+      "diff": "diffs/kit-claim-durable-pid-sans-code.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche claim-durable-pid (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claim-durable-pid"
+    },
+    {
+      "id": "kit-claim-durable-pid-hors-perimetre",
+      "diff": "diffs/kit-claim-durable-pid-hors-perimetre.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche claim-durable-pid (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claim-durable-pid"
+    },
+    {
+      "id": "kit-claude-hooks-protected-paths-bon",
+      "diff": "diffs/kit-claude-hooks-protected-paths-bon.diff",
+      "base": "884efc26a77cf5753a668f8a76a812b30b903daa",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche claude-hooks-protected-paths (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claude-hooks-protected-paths"
+    },
+    {
+      "id": "kit-claude-hooks-protected-paths-sans-code",
+      "diff": "diffs/kit-claude-hooks-protected-paths-sans-code.diff",
+      "base": "884efc26a77cf5753a668f8a76a812b30b903daa",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche claude-hooks-protected-paths (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claude-hooks-protected-paths"
+    },
+    {
+      "id": "kit-claude-hooks-protected-paths-hors-perimetre",
+      "diff": "diffs/kit-claude-hooks-protected-paths-hors-perimetre.diff",
+      "base": "884efc26a77cf5753a668f8a76a812b30b903daa",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche claude-hooks-protected-paths (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claude-hooks-protected-paths"
+    },
+    {
+      "id": "kit-claude-usage-source-bon",
+      "diff": "diffs/kit-claude-usage-source-bon.diff",
+      "base": "d6d83600478f3a4240a2c51d00869d57394a2217",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche claude-usage-source (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claude-usage-source"
+    },
+    {
+      "id": "kit-claude-usage-source-sans-code",
+      "diff": "diffs/kit-claude-usage-source-sans-code.diff",
+      "base": "d6d83600478f3a4240a2c51d00869d57394a2217",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche claude-usage-source (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claude-usage-source"
+    },
+    {
+      "id": "kit-claude-usage-source-hors-perimetre",
+      "diff": "diffs/kit-claude-usage-source-hors-perimetre.diff",
+      "base": "d6d83600478f3a4240a2c51d00869d57394a2217",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche claude-usage-source (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "claude-usage-source"
+    },
+    {
+      "id": "kit-codex-prereqs-bon",
+      "diff": "diffs/kit-codex-prereqs-bon.diff",
+      "base": "7f80244492e3fc6ba54022d4083da0d55287c4be",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche codex-prereqs (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "codex-prereqs"
+    },
+    {
+      "id": "kit-codex-prereqs-sans-code",
+      "diff": "diffs/kit-codex-prereqs-sans-code.diff",
+      "base": "7f80244492e3fc6ba54022d4083da0d55287c4be",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche codex-prereqs (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "codex-prereqs"
+    },
+    {
+      "id": "kit-codex-prereqs-hors-perimetre",
+      "diff": "diffs/kit-codex-prereqs-hors-perimetre.diff",
+      "base": "7f80244492e3fc6ba54022d4083da0d55287c4be",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche codex-prereqs (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "codex-prereqs"
+    },
+    {
+      "id": "kit-consolidate-safety-bon",
+      "diff": "diffs/kit-consolidate-safety-bon.diff",
+      "base": "2cca051cfc0bb3a5d36fe6d8f4a8e008374d36e0",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche consolidate-safety (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "consolidate-safety"
+    },
+    {
+      "id": "kit-consolidate-safety-sans-code",
+      "diff": "diffs/kit-consolidate-safety-sans-code.diff",
+      "base": "2cca051cfc0bb3a5d36fe6d8f4a8e008374d36e0",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche consolidate-safety (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "consolidate-safety"
+    },
+    {
+      "id": "kit-consolidate-safety-hors-perimetre",
+      "diff": "diffs/kit-consolidate-safety-hors-perimetre.diff",
+      "base": "2cca051cfc0bb3a5d36fe6d8f4a8e008374d36e0",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche consolidate-safety (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "consolidate-safety"
+    },
+    {
+      "id": "kit-diff-header-fix-bon",
+      "diff": "diffs/kit-diff-header-fix-bon.diff",
+      "base": "362e18b86933158c489758f415e63445df004ef5",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche diff-header-fix (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "diff-header-fix"
+    },
+    {
+      "id": "kit-diff-header-fix-sans-code",
+      "diff": "diffs/kit-diff-header-fix-sans-code.diff",
+      "base": "362e18b86933158c489758f415e63445df004ef5",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche diff-header-fix (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "diff-header-fix"
+    },
+    {
+      "id": "kit-diff-header-fix-hors-perimetre",
+      "diff": "diffs/kit-diff-header-fix-hors-perimetre.diff",
+      "base": "362e18b86933158c489758f415e63445df004ef5",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche diff-header-fix (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "diff-header-fix"
+    },
+    {
+      "id": "kit-events-usine-bon",
+      "diff": "diffs/kit-events-usine-bon.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche events-usine (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "events-usine"
+    },
+    {
+      "id": "kit-events-usine-sans-code",
+      "diff": "diffs/kit-events-usine-sans-code.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche events-usine (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "events-usine"
+    },
+    {
+      "id": "kit-events-usine-hors-perimetre",
+      "diff": "diffs/kit-events-usine-hors-perimetre.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche events-usine (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "events-usine"
+    },
+    {
+      "id": "kit-gate-docs-kit-bon",
+      "diff": "diffs/kit-gate-docs-kit-bon.diff",
+      "base": "f5ff706551c27172b35f219a75cd249af14f9dda",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche gate-docs-kit (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "gate-docs-kit"
+    },
+    {
+      "id": "kit-gate-docs-kit-sans-code",
+      "diff": "diffs/kit-gate-docs-kit-sans-code.diff",
+      "base": "f5ff706551c27172b35f219a75cd249af14f9dda",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche gate-docs-kit (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "gate-docs-kit"
+    },
+    {
+      "id": "kit-gate-docs-kit-hors-perimetre",
+      "diff": "diffs/kit-gate-docs-kit-hors-perimetre.diff",
+      "base": "f5ff706551c27172b35f219a75cd249af14f9dda",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche gate-docs-kit (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "gate-docs-kit"
+    },
+    {
+      "id": "kit-gemini-relay-sync-bon",
+      "diff": "diffs/kit-gemini-relay-sync-bon.diff",
+      "base": "6cc80637f9fbe735590c3db55f22ced5b54a043d",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche gemini-relay-sync (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "gemini-relay-sync"
+    },
+    {
+      "id": "kit-gemini-relay-sync-hors-perimetre",
+      "diff": "diffs/kit-gemini-relay-sync-hors-perimetre.diff",
+      "base": "6cc80637f9fbe735590c3db55f22ced5b54a043d",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche gemini-relay-sync (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "gemini-relay-sync"
+    },
+    {
+      "id": "kit-hooks-guard-session-match-bon",
+      "diff": "diffs/kit-hooks-guard-session-match-bon.diff",
+      "base": "9ec55304e909409572eed4d8881722ed90e0a4d0",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche hooks-guard-session-match (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "hooks-guard-session-match"
+    },
+    {
+      "id": "kit-hooks-guard-session-match-sans-code",
+      "diff": "diffs/kit-hooks-guard-session-match-sans-code.diff",
+      "base": "9ec55304e909409572eed4d8881722ed90e0a4d0",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche hooks-guard-session-match (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "hooks-guard-session-match"
+    },
+    {
+      "id": "kit-hooks-guard-session-match-hors-perimetre",
+      "diff": "diffs/kit-hooks-guard-session-match-hors-perimetre.diff",
+      "base": "9ec55304e909409572eed4d8881722ed90e0a4d0",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche hooks-guard-session-match (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "hooks-guard-session-match"
+    },
+    {
+      "id": "kit-integration-gate-node-image-bon",
+      "diff": "diffs/kit-integration-gate-node-image-bon.diff",
+      "base": "dd67b433e9e3fc7c300650a5b891fe998b671890",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche integration-gate-node-image (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "integration-gate-node-image"
+    },
+    {
+      "id": "kit-integration-gate-node-image-sans-code",
+      "diff": "diffs/kit-integration-gate-node-image-sans-code.diff",
+      "base": "dd67b433e9e3fc7c300650a5b891fe998b671890",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche integration-gate-node-image (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "integration-gate-node-image"
+    },
+    {
+      "id": "kit-integration-gate-node-image-hors-perimetre",
+      "diff": "diffs/kit-integration-gate-node-image-hors-perimetre.diff",
+      "base": "dd67b433e9e3fc7c300650a5b891fe998b671890",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche integration-gate-node-image (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "integration-gate-node-image"
+    },
+    {
+      "id": "kit-lot2-state-fix-bon",
+      "diff": "diffs/kit-lot2-state-fix-bon.diff",
+      "base": "0f9dc53500881b775987e6970f4ccc20e04ccdc2",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche lot2-state-fix (exécutant antigravity, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "lot2-state-fix"
+    },
+    {
+      "id": "kit-lot2-state-fix-hors-perimetre",
+      "diff": "diffs/kit-lot2-state-fix-hors-perimetre.diff",
+      "base": "0f9dc53500881b775987e6970f4ccc20e04ccdc2",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche lot2-state-fix (exécutant antigravity, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "lot2-state-fix"
+    },
+    {
+      "id": "kit-mission-git-worktree-bon",
+      "diff": "diffs/kit-mission-git-worktree-bon.diff",
+      "base": "7f80244492e3fc6ba54022d4083da0d55287c4be",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche mission-git-worktree (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "mission-git-worktree"
+    },
+    {
+      "id": "kit-mission-git-worktree-sans-code",
+      "diff": "diffs/kit-mission-git-worktree-sans-code.diff",
+      "base": "7f80244492e3fc6ba54022d4083da0d55287c4be",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche mission-git-worktree (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "mission-git-worktree"
+    },
+    {
+      "id": "kit-mission-git-worktree-hors-perimetre",
+      "diff": "diffs/kit-mission-git-worktree-hors-perimetre.diff",
+      "base": "7f80244492e3fc6ba54022d4083da0d55287c4be",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche mission-git-worktree (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "mission-git-worktree"
+    },
+    {
+      "id": "kit-note-subagent-bon",
+      "diff": "diffs/kit-note-subagent-bon.diff",
+      "base": "c3a02aa44de8a56e359c852dbe13376508f8d3a6",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche note-subagent (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "note-subagent"
+    },
+    {
+      "id": "kit-note-subagent-sans-code",
+      "diff": "diffs/kit-note-subagent-sans-code.diff",
+      "base": "c3a02aa44de8a56e359c852dbe13376508f8d3a6",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche note-subagent (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "note-subagent"
+    },
+    {
+      "id": "kit-note-subagent-hors-perimetre",
+      "diff": "diffs/kit-note-subagent-hors-perimetre.diff",
+      "base": "c3a02aa44de8a56e359c852dbe13376508f8d3a6",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche note-subagent (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "note-subagent"
+    },
+    {
+      "id": "kit-orchestrator-launched-by-bon",
+      "diff": "diffs/kit-orchestrator-launched-by-bon.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche orchestrator-launched-by (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "orchestrator-launched-by"
+    },
+    {
+      "id": "kit-orchestrator-launched-by-sans-code",
+      "diff": "diffs/kit-orchestrator-launched-by-sans-code.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche orchestrator-launched-by (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "orchestrator-launched-by"
+    },
+    {
+      "id": "kit-orchestrator-launched-by-hors-perimetre",
+      "diff": "diffs/kit-orchestrator-launched-by-hors-perimetre.diff",
+      "base": "1744283cbe5270aef09039054f2a7fbe7cb6cb4c",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche orchestrator-launched-by (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "orchestrator-launched-by"
+    },
+    {
+      "id": "kit-orphan-agents-bon",
+      "diff": "diffs/kit-orphan-agents-bon.diff",
+      "base": "0f9dc53500881b775987e6970f4ccc20e04ccdc2",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche orphan-agents (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "orphan-agents"
+    },
+    {
+      "id": "kit-orphan-agents-sans-code",
+      "diff": "diffs/kit-orphan-agents-sans-code.diff",
+      "base": "0f9dc53500881b775987e6970f4ccc20e04ccdc2",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche orphan-agents (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "orphan-agents"
+    },
+    {
+      "id": "kit-orphan-agents-hors-perimetre",
+      "diff": "diffs/kit-orphan-agents-hors-perimetre.diff",
+      "base": "0f9dc53500881b775987e6970f4ccc20e04ccdc2",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche orphan-agents (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "orphan-agents"
+    },
+    {
+      "id": "kit-post-merge-defects-bon",
+      "diff": "diffs/kit-post-merge-defects-bon.diff",
+      "base": "c02247883ddeb0166d0fa9153e3e3c93594d77f0",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche post-merge-defects (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "post-merge-defects"
+    },
+    {
+      "id": "kit-post-merge-defects-sans-code",
+      "diff": "diffs/kit-post-merge-defects-sans-code.diff",
+      "base": "c02247883ddeb0166d0fa9153e3e3c93594d77f0",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche post-merge-defects (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "post-merge-defects"
+    },
+    {
+      "id": "kit-post-merge-defects-hors-perimetre",
+      "diff": "diffs/kit-post-merge-defects-hors-perimetre.diff",
+      "base": "c02247883ddeb0166d0fa9153e3e3c93594d77f0",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche post-merge-defects (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "post-merge-defects"
+    },
+    {
+      "id": "kit-prepare-task-orphans-bon",
+      "diff": "diffs/kit-prepare-task-orphans-bon.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche prepare-task-orphans (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "prepare-task-orphans"
+    },
+    {
+      "id": "kit-prepare-task-orphans-sans-code",
+      "diff": "diffs/kit-prepare-task-orphans-sans-code.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche prepare-task-orphans (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "prepare-task-orphans"
+    },
+    {
+      "id": "kit-prepare-task-orphans-hors-perimetre",
+      "diff": "diffs/kit-prepare-task-orphans-hors-perimetre.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche prepare-task-orphans (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "prepare-task-orphans"
+    },
+    {
+      "id": "kit-questions-answer-cli-bon",
+      "diff": "diffs/kit-questions-answer-cli-bon.diff",
+      "base": "c3a02aa44de8a56e359c852dbe13376508f8d3a6",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche questions-answer-cli (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "questions-answer-cli"
+    },
+    {
+      "id": "kit-questions-answer-cli-sans-code",
+      "diff": "diffs/kit-questions-answer-cli-sans-code.diff",
+      "base": "c3a02aa44de8a56e359c852dbe13376508f8d3a6",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche questions-answer-cli (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "questions-answer-cli"
+    },
+    {
+      "id": "kit-questions-answer-cli-hors-perimetre",
+      "diff": "diffs/kit-questions-answer-cli-hors-perimetre.diff",
+      "base": "c3a02aa44de8a56e359c852dbe13376508f8d3a6",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche questions-answer-cli (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "questions-answer-cli"
+    },
+    {
+      "id": "kit-reserve-check-bon",
+      "diff": "diffs/kit-reserve-check-bon.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche reserve-check (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "reserve-check"
+    },
+    {
+      "id": "kit-reserve-check-sans-code",
+      "diff": "diffs/kit-reserve-check-sans-code.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche reserve-check (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "reserve-check"
+    },
+    {
+      "id": "kit-reserve-check-hors-perimetre",
+      "diff": "diffs/kit-reserve-check-hors-perimetre.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche reserve-check (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "reserve-check"
+    },
+    {
+      "id": "kit-resume-cost-study-bon",
+      "diff": "diffs/kit-resume-cost-study-bon.diff",
+      "base": "d6d83600478f3a4240a2c51d00869d57394a2217",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche resume-cost-study (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "resume-cost-study"
+    },
+    {
+      "id": "kit-resume-cost-study-sans-code",
+      "diff": "diffs/kit-resume-cost-study-sans-code.diff",
+      "base": "d6d83600478f3a4240a2c51d00869d57394a2217",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche resume-cost-study (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "resume-cost-study"
+    },
+    {
+      "id": "kit-resume-cost-study-hors-perimetre",
+      "diff": "diffs/kit-resume-cost-study-hors-perimetre.diff",
+      "base": "d6d83600478f3a4240a2c51d00869d57394a2217",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche resume-cost-study (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "resume-cost-study"
+    },
+    {
+      "id": "kit-retry-abandoned-bon",
+      "diff": "diffs/kit-retry-abandoned-bon.diff",
+      "base": "0f9dc53500881b775987e6970f4ccc20e04ccdc2",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche retry-abandoned (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "retry-abandoned"
+    },
+    {
+      "id": "kit-retry-abandoned-sans-code",
+      "diff": "diffs/kit-retry-abandoned-sans-code.diff",
+      "base": "0f9dc53500881b775987e6970f4ccc20e04ccdc2",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche retry-abandoned (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "retry-abandoned"
+    },
+    {
+      "id": "kit-retry-abandoned-hors-perimetre",
+      "diff": "diffs/kit-retry-abandoned-hors-perimetre.diff",
+      "base": "0f9dc53500881b775987e6970f4ccc20e04ccdc2",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche retry-abandoned (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "retry-abandoned"
+    },
+    {
+      "id": "kit-sandbox-init-and-gate-seal-bon",
+      "diff": "diffs/kit-sandbox-init-and-gate-seal-bon.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche sandbox-init-and-gate-seal (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "sandbox-init-and-gate-seal"
+    },
+    {
+      "id": "kit-sandbox-init-and-gate-seal-sans-code",
+      "diff": "diffs/kit-sandbox-init-and-gate-seal-sans-code.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche sandbox-init-and-gate-seal (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "sandbox-init-and-gate-seal"
+    },
+    {
+      "id": "kit-sandbox-init-and-gate-seal-hors-perimetre",
+      "diff": "diffs/kit-sandbox-init-and-gate-seal-hors-perimetre.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche sandbox-init-and-gate-seal (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "sandbox-init-and-gate-seal"
+    },
+    {
+      "id": "kit-session-lock-bon",
+      "diff": "diffs/kit-session-lock-bon.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche session-lock (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "session-lock"
+    },
+    {
+      "id": "kit-session-lock-sans-code",
+      "diff": "diffs/kit-session-lock-sans-code.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche session-lock (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "session-lock"
+    },
+    {
+      "id": "kit-session-lock-hors-perimetre",
+      "diff": "diffs/kit-session-lock-hors-perimetre.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche session-lock (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "session-lock"
+    },
+    {
+      "id": "kit-split-mission-bon",
+      "diff": "diffs/kit-split-mission-bon.diff",
+      "base": "140a88524167923a66ca20b27982265f30fcc986",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche split-mission (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "split-mission"
+    },
+    {
+      "id": "kit-split-mission-hors-perimetre",
+      "diff": "diffs/kit-split-mission-hors-perimetre.diff",
+      "base": "140a88524167923a66ca20b27982265f30fcc986",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche split-mission (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "split-mission"
+    },
+    {
+      "id": "kit-tap-score-bon",
+      "diff": "diffs/kit-tap-score-bon.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche tap-score (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "tap-score"
+    },
+    {
+      "id": "kit-tap-score-sans-code",
+      "diff": "diffs/kit-tap-score-sans-code.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche tap-score (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "tap-score"
+    },
+    {
+      "id": "kit-tap-score-hors-perimetre",
+      "diff": "diffs/kit-tap-score-hors-perimetre.diff",
+      "base": "3de7da53a2c6427574d7eff5f41059644afe2f56",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche tap-score (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "tap-score"
+    },
+    {
+      "id": "kit-task-type-bon",
+      "diff": "diffs/kit-task-type-bon.diff",
+      "base": "64e56a0c7ef9b1a3dd69c1f62480b8fdd018e927",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche task-type (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "task-type"
+    },
+    {
+      "id": "kit-task-type-sans-code",
+      "diff": "diffs/kit-task-type-sans-code.diff",
+      "base": "64e56a0c7ef9b1a3dd69c1f62480b8fdd018e927",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche task-type (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "task-type"
+    },
+    {
+      "id": "kit-task-type-hors-perimetre",
+      "diff": "diffs/kit-task-type-hors-perimetre.diff",
+      "base": "64e56a0c7ef9b1a3dd69c1f62480b8fdd018e927",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche task-type (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "task-type"
+    },
+    {
+      "id": "kit-team-registry-bon",
+      "diff": "diffs/kit-team-registry-bon.diff",
+      "base": "633bf3bab0d9fddd4957bd940a241cf9b216b58c",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche team-registry (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "team-registry"
+    },
+    {
+      "id": "kit-team-registry-sans-code",
+      "diff": "diffs/kit-team-registry-sans-code.diff",
+      "base": "633bf3bab0d9fddd4957bd940a241cf9b216b58c",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche team-registry (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "team-registry"
+    },
+    {
+      "id": "kit-team-registry-hors-perimetre",
+      "diff": "diffs/kit-team-registry-hors-perimetre.diff",
+      "base": "633bf3bab0d9fddd4957bd940a241cf9b216b58c",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche team-registry (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "team-registry"
+    },
+    {
+      "id": "kit-team-subagents-bon",
+      "diff": "diffs/kit-team-subagents-bon.diff",
+      "base": "884efc26a77cf5753a668f8a76a812b30b903daa",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche team-subagents (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "team-subagents"
+    },
+    {
+      "id": "kit-team-subagents-sans-code",
+      "diff": "diffs/kit-team-subagents-sans-code.diff",
+      "base": "884efc26a77cf5753a668f8a76a812b30b903daa",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche team-subagents (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "team-subagents"
+    },
+    {
+      "id": "kit-team-subagents-hors-perimetre",
+      "diff": "diffs/kit-team-subagents-hors-perimetre.diff",
+      "base": "884efc26a77cf5753a668f8a76a812b30b903daa",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche team-subagents (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "team-subagents"
+    },
+    {
+      "id": "kit-verify-gate-refused-bon",
+      "diff": "diffs/kit-verify-gate-refused-bon.diff",
+      "base": "5edeef1109a53e4fb2b00e34dcae5213067e6fa0",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche verify-gate-refused (exécutant claude-haiku, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "verify-gate-refused"
+    },
+    {
+      "id": "kit-verify-gate-refused-sans-code",
+      "diff": "diffs/kit-verify-gate-refused-sans-code.diff",
+      "base": "5edeef1109a53e4fb2b00e34dcae5213067e6fa0",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche verify-gate-refused (exécutant claude-haiku, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "verify-gate-refused"
+    },
+    {
+      "id": "kit-verify-gate-refused-hors-perimetre",
+      "diff": "diffs/kit-verify-gate-refused-hors-perimetre.diff",
+      "base": "5edeef1109a53e4fb2b00e34dcae5213067e6fa0",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche verify-gate-refused (exécutant claude-haiku, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "verify-gate-refused"
+    },
+    {
+      "id": "kit-worktree-bound-bon",
+      "diff": "diffs/kit-worktree-bound-bon.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "accept",
+      "kind": "bon",
+      "source": "tâche worktree-bound (exécutant claude-sonnet, statut merged) : diff du circuit, tel quel",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "worktree-bound"
+    },
+    {
+      "id": "kit-worktree-bound-sans-code",
+      "diff": "diffs/kit-worktree-bound-sans-code.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "reject",
+      "kind": "sans implémentation",
+      "source": "tâche worktree-bound (exécutant claude-sonnet, statut merged) : diff du circuit, seules les sections de test gardées",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "worktree-bound"
+    },
+    {
+      "id": "kit-worktree-bound-hors-perimetre",
+      "diff": "diffs/kit-worktree-bound-hors-perimetre.diff",
+      "base": "48b27fe550dce668fb8e93432d067c1b6642d725",
+      "expected": "reject",
+      "kind": "hors périmètre",
+      "source": "tâche worktree-bound (exécutant claude-sonnet, statut merged) : diff du circuit, section hors périmètre ajoutée",
+      "config": "../../../.workspace/etalons/kit.config.json",
+      "task": "worktree-bound"
+    }
+  ]
+}

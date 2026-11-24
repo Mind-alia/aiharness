@@ -1,0 +1,50 @@
+diff --git a/template/scripts/lib/breaker.py b/template/scripts/lib/breaker.py
+--- a/template/scripts/lib/breaker.py
++++ b/template/scripts/lib/breaker.py
+@@ -36,7 +36,7 @@
+     if name.endswith('.py'):
+         return ['python3', '-B', '-c', PYTHON_RUNNER, name]
+     if re.search(r'\.(?:test|spec)\.[cm]?[jt]sx?$', name):
+-        return ['npx', '--no-install', 'vitest', 'run', name, '--reporter=json']
++        return ['npx', '--no-install', 'vitest', 'run', name, '--reporter=json', '--outputFile.json=/dev/stdout']
+     raise ValueError('Format de test non pris en charge : ' + name)
+ 
+ 
+diff --git a/tests/test_breaker.py b/tests/test_breaker.py
+--- a/tests/test_breaker.py
++++ b/tests/test_breaker.py
+@@ -3,8 +3,10 @@
+ from pathlib import Path
+ import subprocess
+ import signal
++import sys
+ import time
+ import unittest
++sys.path.insert(0, str(Path(__file__).resolve().parent))
+ import test_delegate as fixtures
+ 
+ if os.environ.get('WORKSPACE_TESTS') == 'fast':
+@@ -214,3 +216,23 @@
+         self.assertEqual(self.report()['retained'], [])
+         self.assertIn('out_of_scope', result.stderr)
+         self.assertEqual((self.wt / 'tracked.txt').read_text(), 'implemented\n')
++
++    def test_vitest5_json_on_stdout_is_read_without_report_file(self):
++        # Vitest 5 writes .vitest/json/output.json unless --outputFile.json=/dev/stdout is given.
++        self.prepare({'test_vitest.test.ts': 'test("bug", () => { expect(1).toBe(2) })\n'})
++        self.executable('bin/npx', '\n'.join([
++            '#!/usr/bin/env python3',
++            'import json, sys',
++            'from pathlib import Path',
++            "if '--outputFile.json=/dev/stdout' in sys.argv:",
++            "    print(json.dumps({'numRuntimeErrorTestSuites': 0, 'testResults': [{'assertionResults': [{'status': 'failed', 'failureMessages': ['expected 1 to be 2']}]}]}))",
++            '    raise SystemExit(1)',
++            "p = Path('.vitest/json'); p.mkdir(parents=True)",
++            "(p / 'output.json').write_text('{}')",
++            "print('JSON report written to .vitest/json/output.json')",
++        ]) + '\n')
++        result = self.run_breaker()
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual([r['test'] for r in self.report()['retained']], ['__breaker__/test_vitest.test.ts'])
++        self.assertFalse((self.wt / '.vitest').exists())
++        self.assertTrue(any('--outputFile.json=/dev/stdout' in c for c in self.get_docker_calls()))

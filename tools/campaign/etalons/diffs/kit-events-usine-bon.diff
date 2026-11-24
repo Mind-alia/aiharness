@@ -1,0 +1,479 @@
+
+[TRUNCATED]
+diff --git a/template/scripts/lib/delegate.py b/template/scripts/lib/delegate.py
+--- a/template/scripts/lib/delegate.py
++++ b/template/scripts/lib/delegate.py
+@@ -26,7 +26,9 @@
+ import events
+ import procs
+ import questions
++import sandbox
+ import selfcheck
++import task_phase
+ 
+ 
+ def now():
+@@ -78,6 +80,9 @@
+         outcome_recorded = True
+         events.record(root, current_run.name, 'outcome',
+                       {'outcome': status.get('outcome'), 'attempts': status.get('attempts')})
++        if status.get('outcome') != 'waiting_answer':
++            task_phase.set_phase(root, current_run.name,
++                                 'done' if status.get('outcome') in ('done', 'done_with_warning') else 'failed')
+ 
+ 
+ def update_metrics(status):
+@@ -247,7 +252,11 @@
+                   acceptance_attempts=0, files_changed=[], verify=None, started_at=now(), ended_at=None, warnings=[],
+                   isolation=isolation, isolation_reason=isolation_reason, metrics=metrics)
+     (run / 'status.json').write_text(json.dumps(status))
+-    events.record(root, task['id'], 'delegate_started', {'agent': task['agent'], 'isolation': isolation})
++    events.record(root, task['id'], 'delegate_started',
++                  {'agent': task['agent'], 'isolation': isolation,
++                   'container': sandbox.get_container_name(root, task['id']) if isolation == 'exchange' else None,
++                   'verify': task.get('verify') or None})
++    task_phase.set_phase(root, task['id'], 'delegated')
+ 
+     if isolation == 'exchange':
+         state_file = root / f'.workspace/orchestration/tasks/{task["id"]}/state.json'
+@@ -400,7 +409,8 @@
+             attempt_started = time.monotonic()
+             metrics['attempts'] = attempt
+             status['attempts'] = attempt
+-            events.record(root, task['id'], 'attempt_started', {'attempt': attempt})
++            events.record(root, task['id'], 'attempt_started', {'attempt': attempt, 'phase': 'attempt'})
++            task_phase.set_phase(root, task['id'], 'attempt %d' % attempt)
+             (run / 'prompt.md').write_text(prompt, encoding='utf-8')
+             # Never accept a response left over from an earlier attempt or run.
+             (run / 'answer.md').write_text('', encoding='utf-8')
+@@ -468,6 +478,7 @@
+                     break
+             verify = root / 'scripts/verify-task.sh'
+             if verify.is_file():
++                task_phase.set_phase(root, task['id'], 'verifying')
+                 exit_code, out, err = execute(['bash', str(verify), str(contract)], cwd=work_dir)
+                 (run / 'verify.txt').write_text(mask_secrets(bounded(out + err), values), encoding='utf-8')
+                 if not intact():
+@@ -486,6 +497,7 @@
+                         continue
+             if status['outcome'] in ('done', 'done_with_warning') and task_path != root / '.workspace/breaker' / task['id'] / 'task.md' and has_acceptance(task, root):
+                 status['acceptance_attempts'] += 1
++                task_phase.set_phase(root, task['id'], 'acceptance')
+                 exit_code, feedback = run_acceptance(task, root, work_dir, execute, isolation == 'exchange')
+                 events.record(root, task['id'], 'acceptance', {'attempt': attempt, 'code': exit_code})
+                 feedback = mask_secrets(bounded(feedback), values)
+diff --git a/template/scripts/lib/events.py b/template/scripts/lib/events.py
+--- a/template/scripts/lib/events.py
++++ b/template/scripts/lib/events.py
+@@ -22,6 +22,7 @@
+ sys.dont_write_bytecode = True
+ 
+ EVENTS_PATH = '.workspace/events.jsonl'
++LOCK_PATH = '.workspace/orchestrator.json'
+ KINDS = ('prepared', 'delegate_started', 'attempt_started', 'attempt_finished', 'verify',
+          'acceptance', 'outcome', 'merged', 'closed', 'quota', 'orchestrator_claimed', 'orchestrator_released',
+          'selfcheck', 'subagent_started', 'subagent_finished', 'question_answered')
+@@ -31,16 +32,29 @@
+     print('events: ' + str(error).replace('\n', ' '), file=sys.stderr)
+ 
+ 
++def _orchestrator(root):
++    """Session de l'orchestrateur lue dans le verrou, `None` si absente ou illisible (jamais d'exception)."""
++    path = root / LOCK_PATH
++    try:
++        safety.check_no_symlinks(path, root)
++        data = json.loads(path.read_text(encoding='utf-8'))
++    except (OSError, ValueError, RecursionError):
++        return None
++    session = data.get('session') if isinstance(data, dict) else None
++    return session if isinstance(session, str) and session else None
++
++
+ def record(root, task_id, event, detail=None):
+     """Ajoute un événement. `ValueError` si `event` est inconnu ou `task_id` vide."""
+     if event not in KINDS:
+         raise ValueError('événement inconnu : %r' % (event,))
+     if not isinstance(task_id, str) or not task_id:
+         raise ValueError('task_id vide')
++    root = Path(root)
+     line = json.dumps({'at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+-                       'task_id': task_id, 'event': event, 'detail': detail},
++                       'task_id': task_id, 'event': event, 'detail': detail,
++                       'orchestrator': _orchestrator(root)},
+                       ensure_ascii=False, sort_keys=True, default=str) + '\n'
+-    root = Path(root)
+     path = root / EVENTS_PATH
+     try:
+         safety.check_no_symlinks(path, root)
+diff --git a/template/scripts/lib/mission.py b/template/scripts/lib/mission.py
+--- a/template/scripts/lib/mission.py
++++ b/template/scripts/lib/mission.py
+@@ -39,6 +39,7 @@
+ from mission_retry import prepare_retry
+ import events
+ import selfcheck
++import task_phase
+ from task_cost import print_cost_line
+ from mission_check import ACTIVE_STATUSES, cmd_check, iter_registry_states, resolve_task_file, validate_state_data
+ 
+@@ -157,6 +158,7 @@
+                 "branch": branch_name,
+                 "worktree": rel_worktree,
+                 "status": "prepared",
++                "phase": "prepared",
+                 "created_at": created_at,
+                 "task_sha256": task_sha256,
+                 "source_task": rel_task
+@@ -333,6 +335,7 @@
+             run_git(root, ['update-ref', '-d', ref, tip])
+ 
+         state['status'] = outcome
++        state['phase'] = 'abandoned' if outcome == 'abandoned' else 'done'
+         state['closed_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+         state['close_force'] = force
+         state['branch_kept'] = outcome == 'abandoned' or keep_branch
+@@ -400,6 +403,17 @@
+             raise ValueError("Worktree de tâche introuvable.")
+         if run_git(worktree, ['symbolic-ref', '--quiet', 'HEAD']).stdout.strip() != 'refs/heads/' + branch:
+             raise ValueError("Branche du worktree incohérente.")
++
++        def set_phase(phase: str) -> None:
++            # The in-memory state is dumped later: keep it in step with the file.
++            state['phase'] = phase
++            task_phase.set_phase(root, task_id, phase)
++
++        set_phase('merging')
++        # A container has no Git identity: fall back to a neutral one rather than fail with status 128.
++        identity = [] if all(run_git(worktree, ['var', name], check=False).returncode == 0
++                             for name in ('GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT')) else \
++            ['-c', 'user.name=Workspace', '-c', 'user.email=workspace@localhost.invalid']
+         task_path = root / state['source_task']
+         check_path_security(task_path, root)
+         data = read_task(task_path)
+@@ -431,7 +445,7 @@
+             if not message.strip():
+                 raise ValueError("Message de commit vide.")
+             run_git(worktree, ['add', '--all'])
+-            run_git(worktree, ['commit', '-m', message])
++            run_git(worktree, [*identity, 'commit', '-m', message])
+         target_head = run_git(root, ['rev-parse', 'HEAD']).stdout.strip()
+ 
+         def handle_merge_failure(merge_root: Path, result: subprocess.CompletedProcess) -> None:
+@@ -442,6 +456,7 @@
+             if conflicts:
+                 state['status'] = 'merge_conflict'
+                 state['conflict_files'] = [path for path in conflicts.split('\0') if path]
++                set_phase('failed')
+                 state_file = root / '.workspace/orchestration/tasks' / task_id / 'state.json'
+                 tmp = state_file.with_name('state.json.merge.' + str(os.getpid()))
+                 try:
+@@ -457,7 +472,7 @@
+             raise ValueError("Fusion refusée" + (" (conflits : " + names + ")" if names else "") +
+                              " : " + result.stderr + result.stdout)
+ 
+-        result = run_git(worktree, ['merge', '--no-edit', target_head], check=False)
++        result = run_git(worktree, [*identity, 'merge', '--no-edit', target_head], check=False)
+         if result.returncode:
+             handle_merge_failure(worktree, result)
+         if not no_verify or has_acceptance(data, root):
+@@ -480,6 +495,7 @@
+                     code, feedback = run_acceptance(data, root, worktree, acceptance_execute, exchange)
+                     if code:
+                         state['outcome'] = 'acceptance_failed'
++                        set_phase('failed')
+                         state_file = root / '.workspace/orchestration/tasks' / task_id / 'state.json'
+                         state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+                         events.record(root, task_id, 'outcome', {'outcome': 'acceptance_failed'})
+@@ -525,7 +541,7 @@
+             print("Porte d'intégration sautée (--no-integration)." if no_integration else
+                   "aucune porte d'intégration configurée")
+             save_state()
+-            result = run_git(root, ['merge', '--no-ff', '-m', 'merge: task ' + task_id, branch], check=False)
++            result = run_git(root, [*identity, 'merge', '--no-ff', '-m', 'merge: task ' + task_id, branch], check=False)
+             if result.returncode:
+                 handle_merge_failure(root, result)
+         else:
+@@ -541,7 +557,7 @@
+             sandbox = ['bash', str(root / 'scripts/sandbox.sh')]
+             try:
+                 run_git(root, ['worktree', 'add', '--detach', str(integration), target_head])
+-                result = run_git(integration, ['merge', '--no-ff', '-m', 'merge: task ' + task_id, branch], check=False)
++                result = run_git(integration, [*identity, 'merge', '--no-ff', '-m', 'merge: task ' + task_id, branch], check=False)
+                 if result.returncode:
+                     handle_merge_failure(integration, result)
+                 checked_commit = run_git(integration, ['rev-parse', 'HEAD']).stdout.strip()
+@@ -572,6 +588,7 @@
+                                             status='passed' if code == 0 else 'failed')
+                 if code:
+                     state['status'] = 'integration_failed'
++                    set_phase('failed')
+                     values = sorted(set(values) | set(known_values(root)) | set(known_values(integration)))
+                     state['integration']['output'] = '\n'.join(mask_secrets(
+                         output.decode('utf-8', errors='replace'), values).splitlines()[-40:])
+@@ -596,6 +613,7 @@
+                         if integration.exists():
+                             run_git(root, ['worktree', 'remove', '--force', '--', str(integration)])
+         events.record(root, task_id, 'merged', {'commit': run_git(root, ['rev-parse', 'HEAD']).stdout.strip()})
++        set_phase('done')
+         print_cost_line(root, task_id)
+         return cmd_close(root, task_id, 'merged', False, False, registry_locked=True)
+     finally:
+diff --git a/template/scripts/lib/task_phase.py b/template/scripts/lib/task_phase.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/task_phase.py
+@@ -0,0 +1,53 @@
++"""Phase lisible d'une tâche, écrite dans son `state.json` (Python 3.9, stdlib seule).
++
++La phase tient en un mot pour le hub des usines. Elle n'est jamais une condition
++du circuit : une écriture qui échoue écrit `task_phase: ...` sur stderr et rend la main.
++Sans `state.json` (délégation sur l'hôte sans `prepare`), rien n'est créé.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import re
++import sys
++
++import safety
++
++sys.dont_write_bytecode = True
++
++PHASES = ('prepared', 'delegated', 'verifying', 'acceptance', 'merging', 'done', 'failed', 'abandoned')
++ATTEMPT_PHASE = re.compile(r'attempt [1-9][0-9]*')
++
++
++def _warn(error):
++    print('task_phase: ' + str(error).replace('\n', ' '), file=sys.stderr)
++
++
++def set_phase(root, task_id, phase):
++    """Écrit `phase` dans l'état de la tâche s'il existe. `ValueError` si `phase` est inconnue."""
++    if not (phase in PHASES or (isinstance(phase, str) and ATTEMPT_PHASE.fullmatch(phase))):
++        raise ValueError('phase inconnue : %r' % (phase,))
++    root = Path(root)
++    state_file = root / '.workspace/orchestration/tasks' / task_id / 'state.json'
++    tmp = state_file.with_name('state.json.phase.%d' % os.getpid())
++    try:
++        if not state_file.exists() and not state_file.is_symlink():
++            return
++        safety.check_no_symlinks(state_file, root)
++        state = json.loads(state_file.read_text(encoding='utf-8'))
++        if not isinstance(state, dict):
++            raise ValueError('état illisible : objet JSON attendu')
++        state['phase'] = phase
++        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
++        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
++            json.dump(state, stream, indent=2, ensure_ascii=False)
++            stream.write('\n')
++        os.replace(tmp, state_file)
++    except (OSError, ValueError) as error:
++        _warn(error)
++    finally:
++        try:
++            tmp.unlink()
++        except OSError:
++            pass
+diff --git a/tests/test_events.py b/tests/test_events.py
+--- a/tests/test_events.py
++++ b/tests/test_events.py
+@@ -45,13 +45,61 @@
+         events.record(self.root, 'demo', 'attempt_started', {'z': 1, 'attempt': 1, 'text': 'é'})
+         events.record(self.root, 'demo', 'closed')
+         first, second = self.lines()
+-        self.assertEqual(list(json.loads(first)), ['at', 'detail', 'event', 'task_id'])
++        self.assertEqual(list(json.loads(first)), ['at', 'detail', 'event', 'orchestrator', 'task_id'])
+         self.assertIn('"detail": {"attempt": 1, "text": "é", "z": 1}', first)
+         entry = json.loads(first)
+         self.assertTrue(entry['at'].endswith('+00:00'))
+         self.assertEqual(datetime.datetime.fromisoformat(entry['at']).utcoffset(), datetime.timedelta(0))
+         self.assertEqual((entry['task_id'], entry['event']), ('demo', 'attempt_started'))
+         self.assertIsNone(json.loads(second)['detail'])
++
++    def put_lock(self, text):
++        lock = self.root / events.LOCK_PATH
++        lock.parent.mkdir(exist_ok=True)
++        lock.write_text(text, encoding='utf-8')
++
++    def orchestrator_of_new_line(self):
++        err = io.StringIO()
++        with contextlib.redirect_stderr(err):
++            events.record(self.root, 'demo', 'outcome')
++        self.assertEqual(err.getvalue(), '')
++        return json.loads(self.lines()[-1])['orchestrator']
++
++    def test_orchestrator_is_the_session_of_the_lock(self):
++        self.put_lock(json.dumps({'session': 'usine-1', 'model': 'm', 'pid': 1}))
++        self.assertEqual(self.orchestrator_of_new_line(), 'usine-1')
++
++    def test_orchestrator_is_null_without_lock(self):
++        self.assertIsNone(self.orchestrator_of_new_line())
++
++    def test_orchestrator_is_null_with_unreadable_lock(self):
++        for text in ('{pas du json', '', '[1, 2]', '"usine"', '{"model": "m"}'):
++            with self.subTest(text=text):
++                self.put_lock(text)
++                self.assertIsNone(self.orchestrator_of_new_line())
++
++    def test_orchestrator_is_null_with_empty_or_non_string_session(self):
++        for session in ('', None, 3, ['a']):
++            with self.subTest(session=session):
++                self.put_lock(json.dumps({'session': session}))
++                self.assertIsNone(self.orchestrator_of_new_line())
++
++    def test_orchestrator_is_null_when_lock_is_a_symlink(self):
++        target = self.root / 'elsewhere.json'
++        target.write_text(json.dumps({'session': 'usine-1'}), encoding='utf-8')
++        (self.root / '.workspace').mkdir()
++        (self.root / events.LOCK_PATH).symlink_to(target)
++        self.assertIsNone(self.orchestrator_of_new_line())
++
++    def test_orchestrator_is_null_when_lock_is_a_directory(self):
++        (self.root / events.LOCK_PATH).mkdir(parents=True)
++        self.assertIsNone(self.orchestrator_of_new_line())
++
++    def test_every_line_carries_the_orchestrator_key(self):
++        self.put_lock(json.dumps({'session': 'usine-1'}))
++        for kind in ('prepared', 'closed'):
++            events.record(self.root, 'demo', kind)
++        self.assertEqual([e['orchestrator'] for e in events.read(self.root)], ['usine-1', 'usine-1'])
+ 
+     def test_record_creates_workspace_0700_and_file_0600(self):
+         old = os.umask(0o022)
+diff --git a/tests/test_task_phase.py b/tests/test_task_phase.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_task_phase.py
+@@ -0,0 +1,130 @@
++"""Tests unitaires de template/scripts/lib/task_phase.py (aucun accès réseau)."""
++import contextlib
++import io
++import json
++import os
++from pathlib import Path
++import stat
++import sys
++import tempfile
++import unittest
++from unittest import mock
++
++LIB = Path(__file__).resolve().parents[1] / 'template/scripts/lib'
++sys.path.insert(0, str(LIB))
++
++import task_phase  # noqa: E402
++
++
++class TaskPhaseTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name).resolve()
++        self.directory = self.root / '.workspace/orchestration/tasks/demo'
++        self.state = self.directory / 'state.json'
++
++    def put_state(self, data=None):
++        self.directory.mkdir(parents=True)
++        self.state.write_text(json.dumps(data if data is not None else
++                                         {'task_id': 'demo', 'status': 'prepared', 'allowed': ['a']}),
++                              encoding='utf-8')
++
++    def phase_stderr(self, *args):
++        err = io.StringIO()
++        with contextlib.redirect_stderr(err):
++            task_phase.set_phase(self.root, *args)
++        return err.getvalue()
++
++    def test_writes_phase_and_keeps_other_keys(self):
++        self.put_state()
++        self.assertEqual(self.phase_stderr('demo', 'delegated'), '')
++        self.assertEqual(json.loads(self.state.read_text(encoding='utf-8')),
++                         {'task_id': 'demo', 'status': 'prepared', 'allowed': ['a'], 'phase': 'delegated'})
++
++    def test_replaces_previous_phase(self):
++        self.put_state({'task_id': 'demo', 'phase': 'prepared'})
++        task_phase.set_phase(self.root, 'demo', 'attempt 2')
++        self.assertEqual(json.loads(self.state.read_text(encoding='utf-8'))['phase'], 'attempt 2')
++
++    def test_write_is_atomic_0600_and_leaves_no_temporary_file(self):
++        self.put_state()
++        old = os.umask(0o022)
++        self.addCleanup(os.umask, old)
++        with mock.patch('os.replace', wraps=os.replace) as replace:
++            task_phase.set_phase(self.root, 'demo', 'verifying')
++        source, target = replace.call_args[0]
++        self.assertEqual(Path(source).parent, self.directory)
++        self.assertEqual(Path(target), self.state)
++        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o600)
++        self.assertEqual([p.name for p in self.directory.iterdir()], ['state.json'])
++
++    def test_failed_replace_keeps_the_old_state(self):
++        self.put_state()
++        before = self.state.read_text(encoding='utf-8')
++        with mock.patch('os.replace', side_effect=PermissionError('refusé')):
++            message = self.phase_stderr('demo', 'merging')
++        self.assertEqual(message, 'task_phase: refusé\n')
++        self.assertEqual(self.state.read_text(encoding='utf-8'), before)
++        self.assertEqual([p.name for p in self.directory.iterdir()], ['state.json'])
++
++    def test_missing_state_creates_nothing(self):
++        self.assertEqual(self.phase_stderr('demo', 'delegated'), '')
++        self.assertFalse((self.root / '.workspace').exists())
++
++    def test_accepted_values(self):
++        self.put_state()
++        for phase in ('prepared', 'delegated', 'attempt 1', 'attempt 12', 'verifying', 'acceptance',
++                      'merging', 'done', 'failed', 'abandoned'):
++            with self.subTest(phase=phase):
++                task_phase.set_phase(self.root, 'demo', phase)
++                self.assertEqual(json.loads(self.state.read_text(encoding='utf-8'))['phase'], phase)
++
++    def test_other_values_are_programming_errors(self):
++        self.put_state()
++        before = self.state.read_text(encoding='utf-8')
++        for phase in ('', 'running', 'attempt', 'attempt 0', 'attempt -1', 'attempt 1.5', 'attempt  1',
++                      'attempt 1\n', 'Done', None, 3):
++            with self.subTest(phase=phase), self.assertRaises(ValueError):
++                task_phase.set_phase(self.root, 'demo', phase)
++        self.assertEqual(self.state.read_text(encoding='utf-8'), before)
++
++    def test_invalid_value_is_refused_even_without_state(self):
++        with self.assertRaises(ValueError):
++            task_phase.set_phase(self.root, 'demo', 'running')
++
++    def test_symlinked_state_is_refused_without_exception(self):
++        target = self.root / 'elsewhere.json'
++        target.write_text('{"task_id": "demo"}', encoding='utf-8')
++        self.directory.mkdir(parents=True)
++        self.state.symlink_to(target)
++        self.assertTrue(self.phase_stderr('demo', 'done').startswith('task_phase: '))
++        self.assertEqual(target.read_text(encoding='utf-8'), '{"task_id": "demo"}')
++        self.assertTrue(self.state.is_symlink())
++
++    def test_symlinked_parent_is_refused_without_exception(self):
++        elsewhere = self.root / 'elsewhere'
++        (elsewhere / 'demo').mkdir(parents=True)
++        (elsewhere / 'demo/state.json').write_text('{"task_id": "demo"}', encoding='utf-8')
++        (self.root / '.workspace/orchestration').mkdir(parents=True)
++        (self.root / '.workspace/orchestration/tasks').symlink_to(elsewhere)
++        self.assertTrue(self.phase_stderr('demo', 'done').startswith('task_phase: '))
++        self.assertEqual((elsewhere / 'demo/state.json').read_text(encoding='utf-8'), '{"task_id": "demo"}')
++        self.assertEqual(sorted(p.name for p in (elsewhere / 'demo').iterdir()), ['state.json'])
++
++    def test_unreadable_json_is_reported_and_left_untouched(self):
++        self.directory.mkdir(parents=True)
++        self.state.write_text('{pas du json', encoding='utf-8')
++        message = self.phase_stderr('demo', 'failed')
++        self.assertTrue(message.startswith('task_phase: '))
++        self.assertEqual(message.count('\n'), 1)
++        self.assertEqual(self.state.read_text(encoding='utf-8'), '{pas du json')
++
++    def test_non_object_json_is_reported_and_left_untouched(self):
++        self.put_state([1, 2])
++        self.assertTrue(self.phase_stderr('demo', 'failed').startswith('task_phase: '))
++        self.assertEqual(json.loads(self.state.read_text(encoding='utf-8')), [1, 2])
++
++
++if __name__ == '__main__':
++    unittest.main()

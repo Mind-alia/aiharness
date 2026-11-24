@@ -1,0 +1,367 @@
+
+[TRUNCATED]
+diff --git a/template/scripts/lib/delegate.py b/template/scripts/lib/delegate.py
+--- a/template/scripts/lib/delegate.py
++++ b/template/scripts/lib/delegate.py
+@@ -26,6 +26,7 @@
+ import events
+ import procs
+ import questions
++import selfcheck
+ 
+ 
+ def now():
+@@ -376,6 +377,17 @@
+                 return True
+         return False
+     try:
++        if (isolation == 'exchange' and has_acceptance(task, root) and os.environ.get('WORKSPACE_NO_SELFCHECK') != '1'
++                and task_path != root / '.workspace/breaker' / task['id'] / 'task.md'
++                and selfcheck.at_base(root, task['id'], work_dir)
++                and selfcheck.run(root, task, work_dir, execute) == 0):
++            status['outcome'] = 'acceptance_vacuous'
++            status['ended_at'] = now()
++            record_outcome(status)
++            (run / 'status.json').write_text(json.dumps(status, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
++            sanitize()
++            print(mask_secrets(selfcheck.MESSAGE, values), file=sys.stderr)
++            return 1
+         warning = False
+         for attempt in range(1, task['attempts'] + 1):
+             if not intact():
+diff --git a/template/scripts/lib/mission.py b/template/scripts/lib/mission.py
+--- a/template/scripts/lib/mission.py
++++ b/template/scripts/lib/mission.py
+@@ -38,6 +38,7 @@
+ from mission_git import run_git, verify_git_root, verify_git_head_and_clean, resolve_base_commit, prevalidate_branch_and_worktree
+ from mission_retry import prepare_retry
+ import events
++import selfcheck
+ from mission_check import ACTIVE_STATUSES, cmd_check, iter_registry_states, resolve_task_file, validate_state_data
+ 
+ 
+@@ -595,7 +596,7 @@
+ def main() -> int:
+     os.umask(0o077)
+     if len(sys.argv) < 3:
+-        print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry] | check <task.md> | status [<task-id>] | merge <id> [--no-verify-again] [--no-integration] [--message TEXT] | close <id> --merged|--abandoned [--keep-branch] [--force]", file=sys.stderr)
++        print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry] [--selfcheck] | check <task.md> | status [<task-id>] | merge <id> [--no-verify-again] [--no-integration] [--message TEXT] | close <id> --merged|--abandoned [--keep-branch] [--force]", file=sys.stderr)
+         return 64
+ 
+     root = Path(sys.argv[1]).resolve()
+@@ -607,6 +608,7 @@
+             task_file_arg = None
+             base_ref = None
+             retry = False
++            check_base = False
+             idx = 3
+             while idx < len(sys.argv):
+                 arg = sys.argv[idx]
+@@ -622,16 +624,22 @@
+                 elif arg == '--retry':
+                     retry = True
+                     idx += 1
++                elif arg == '--selfcheck':
++                    check_base = True
++                    idx += 1
+                 elif task_file_arg is None:
+                     task_file_arg = arg
+                     idx += 1
+                 else:
+-                    print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry]", file=sys.stderr)
++                    print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry] [--selfcheck]", file=sys.stderr)
+                     return 64
+             if task_file_arg is None:
+-                print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry]", file=sys.stderr)
++                print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry] [--selfcheck]", file=sys.stderr)
+                 return 64
+-            return cmd_prepare(root, task_file_arg, base_ref, caller_cwd, retry)
++            code = cmd_prepare(root, task_file_arg, base_ref, caller_cwd, retry)
++            if code == 0 and check_base:
++                code = selfcheck.prepare_selfcheck(root, read_task(resolve_task_file(root, task_file_arg, caller_cwd))['id'])
++            return code
+         elif action == 'check':
+             if len(sys.argv) != 4:
+                 print("Usage : task-workspace.sh check <task.md>", file=sys.stderr)
+diff --git a/template/scripts/lib/selfcheck.py b/template/scripts/lib/selfcheck.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/selfcheck.py
+@@ -0,0 +1,78 @@
++"""Contrôle préalable du test caché : il doit échouer sur la base de la tâche (Python 3.9, stdlib seule).
++
++Un test caché qui passe avant tout travail ne prouve rien. `delegate.py` l'exécute dans le conteneur
++de la tâche, worktree encore à la base ; `task-workspace.sh prepare --selfcheck` fait de même à la préparation.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import subprocess
++import sys
++
++sys.dont_write_bytecode = True
++
++import breaker
++import events
++from task import read_task, safe_path
++
++MESSAGE = ('acceptance_vacuous : le test caché passe déjà sur la base de la tâche ; corriger le test caché avant de déléguer '
++           '(WORKSPACE_NO_SELFCHECK=1 pour passer outre).')
++VACUOUS_CODE = 3
++
++
++def _git(worktree, *args):
++    result = subprocess.run(['git', '-C', str(worktree), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    return result.returncode, result.stdout
++
++
++def at_base(root, task_id, worktree):
++    """Vrai si le worktree est propre et son HEAD égal au `base_commit` de l'état de la tâche."""
++    try:
++        state = json.loads(safe_path(Path(root) / '.workspace/orchestration/tasks' / task_id / 'state.json')
++                           .read_text(encoding='utf-8'))
++        base = state.get('base_commit')
++    except (OSError, ValueError, AttributeError):
++        return False
++    if not isinstance(base, str) or not base:
++        return False
++    code, out = _git(worktree, 'status', '--porcelain', '--untracked-files=all')
++    if code or out.strip():
++        return False
++    code, head = _git(worktree, 'rev-parse', 'HEAD')
++    return code == 0 and head.strip() == base
++
++
++def run(root, task, worktree, execute):
++    """Exécute l'acceptation en conteneur, enregistre l'événement `selfcheck` et retourne le code."""
++    code, _ = breaker.run_acceptance(task, root, worktree, execute, True)
++    events.record(root, task['id'], 'selfcheck', {'code': code})
++    return code
++
++
++def prepare_selfcheck(root, task_id):
++    """Contrôle d'une tâche préparée (`prepare --selfcheck`) : 3 si le test caché passe déjà, sinon 0."""
++    root = Path(root)
++    state = json.loads(safe_path(root / '.workspace/orchestration/tasks' / task_id / 'state.json').read_text(encoding='utf-8'))
++    task = read_task(safe_path(root / state['source_task']))
++    if not breaker.has_acceptance(task, root):
++        print('selfcheck : aucun test caché, rien à contrôler')
++        return 0
++    sandbox = ['bash', str(root / 'scripts/sandbox.sh')]
++
++    def execute(args, cwd=None):
++        result = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++        return result.returncode, result.stdout, result.stderr
++
++    code, out, err = execute(sandbox + ['start', task_id])
++    if code:
++        raise ValueError('selfcheck : démarrage du conteneur impossible : ' + (out + err).strip())
++    try:
++        code = run(root, task, root / state['worktree'], execute)
++    finally:
++        execute(sandbox + ['stop', task_id])
++    if code == 0:
++        print(MESSAGE, file=sys.stderr)
++        return VACUOUS_CODE
++    print('selfcheck : le test caché échoue sur la base (code %d), délégation possible' % code)
++    return 0
+diff --git a/template/scripts/task-workspace.sh b/template/scripts/task-workspace.sh
+--- a/template/scripts/task-workspace.sh
++++ b/template/scripts/task-workspace.sh
+@@ -1,6 +1,6 @@
+ #!/bin/sh
+ umask 077
+-# Usage: task-workspace.sh prepare <task.md> [--base REF] | check <task.md> | status [<task-id>] | merge <id> [--no-verify-again] [--no-integration] [--message "<texte>"] | close <id> --merged|--abandoned [--keep-branch] [--force]
++# Usage: task-workspace.sh prepare <task.md> [--base REF] [--retry] [--selfcheck] | check <task.md> | status [<task-id>] | merge <id> [--no-verify-again] [--no-integration] [--message "<texte>"] | close <id> --merged|--abandoned [--keep-branch] [--force]
+ set -eu
+ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ root=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
+[TRUNCATED]
+diff --git a/tests/test_delegate.py b/tests/test_delegate.py
+--- a/tests/test_delegate.py
++++ b/tests/test_delegate.py
+@@ -327,10 +327,50 @@
+         (hidden / 'hidden.py').write_text('# hidden')
+         task.write_text(task.read_text().replace('agent: codex',
+             'agent: codex\nacceptance: [hidden.py]\nacceptance_verify: python3 hidden.py'))
+-        result = self.run_delegate(task_rel=str(task))
++        result = self.run_delegate(task_rel=str(task), env={'WORKSPACE_NO_SELFCHECK': '1'})
+         self.assertEqual(result.returncode, 0, result.stderr)
+         self.assertTrue(any('python3 hidden.py' in ' '.join(c) for c in self.get_docker_calls() if c[0] == 'exec'))
+         self.assertFalse((self.root / '.workspace/worktrees/hidden-exchange/hidden.py').exists())
++
++    def prepare_hidden_task(self):
++        task = self.prepare_exchange_task('hidden-check', profile='python', verify='true')
++        hidden = self.root / '.workspace/acceptance/hidden-check'
++        hidden.mkdir(parents=True)
++        (hidden / 'hidden.py').write_text('# hidden')
++        task.write_text(task.read_text().replace('agent: codex',
++            'agent: codex\nacceptance: [hidden.py]\nacceptance_verify: python3 hidden.py'))
++        return task
++
++    def selfcheck_codes(self, task_id):
++        return [e['detail']['code'] for e in
++                (json.loads(line) for line in (self.root / '.workspace/events.jsonl').read_text().splitlines())
++                if e['task_id'] == task_id and e['event'] == 'selfcheck']
++
++    def test_selfcheck_vacuous_hidden_test_stops_before_any_attempt(self):
++        task = self.prepare_hidden_task()
++        result = self.run_delegate(task_rel=str(task))
++        self.assertEqual(result.returncode, 1, result.stderr)
++        self.assertIn('acceptance_vacuous', result.stderr)
++        status = self.status('hidden-check')
++        self.assertEqual(status['outcome'], 'acceptance_vacuous')
++        self.assertEqual(status['attempts'], 0)
++        self.assertEqual(self.selfcheck_codes('hidden-check'), [0])
++        self.assertFalse((self.root / '.workspace/worktrees/hidden-check/hidden.py').exists())
++        self.assertTrue(any(c[0] == 'rm' for c in self.get_docker_calls()))
++
++    def test_selfcheck_failing_hidden_test_lets_delegation_run(self):
++        task = self.prepare_hidden_task()
++        result = self.run_delegate(task_rel=str(task), env={'SIMULATE_EXEC_CODE': '1'})
++        self.assertEqual(self.selfcheck_codes('hidden-check'), [1])
++        self.assertGreaterEqual(self.status('hidden-check')['attempts'], 1)
++        self.assertNotIn('acceptance_vacuous', result.stderr)
++
++    def test_selfcheck_skipped_when_worktree_is_not_at_base(self):
++        task = self.prepare_hidden_task()
++        (self.root / '.workspace/worktrees/hidden-check/tracked.txt').write_text('worked on')
++        self.run_delegate(task_rel=str(task))
++        self.assertEqual(self.selfcheck_codes('hidden-check'), [])
++        self.assertNotEqual(self.status('hidden-check')['outcome'], 'acceptance_vacuous')
+ 
+     def consumption_rows(self):
+         return [json.loads(line) for line in (self.root / '.workspace/metrics/consumption.jsonl').read_text().splitlines()]
+diff --git a/tests/test_selfcheck.py b/tests/test_selfcheck.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_selfcheck.py
+@@ -0,0 +1,120 @@
++import contextlib
++import io
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import unittest
++from unittest import mock
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'template/scripts/lib'))
++import events
++import selfcheck
++
++if os.environ.get('WORKSPACE_TESTS') == 'fast':
++    raise unittest.SkipTest('module lent : Git réel ; suite complète seulement')
++
++
++class SelfcheckTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name).resolve()
++        self.git(self.root, 'init', '-q')
++        (self.root / 'tracked.txt').write_text('before\n')
++        self.git(self.root, 'add', 'tracked.txt')
++        self.git(self.root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base')
++        self.base = self.git(self.root, 'rev-parse', 'HEAD').strip()
++        self.worktree = self.root / 'wt'
++        self.git(self.root, 'worktree', 'add', '-q', '--detach', str(self.worktree), self.base)
++        self.state = self.root / '.workspace/orchestration/tasks/demo/state.json'
++        self.state.parent.mkdir(parents=True)
++        self.state.write_text(json.dumps({'task_id': 'demo', 'base_commit': self.base}))
++
++    @staticmethod
++    def git(cwd, *args):
++        return subprocess.run(['git', '-C', str(cwd), *args], check=True, stdout=subprocess.PIPE, text=True).stdout
++
++    def test_at_base_true_on_fresh_worktree(self):
++        self.assertTrue(selfcheck.at_base(self.root, 'demo', self.worktree))
++
++    def test_at_base_false_after_tracked_modification(self):
++        (self.worktree / 'tracked.txt').write_text('changed\n')
++        self.assertFalse(selfcheck.at_base(self.root, 'demo', self.worktree))
++
++    def test_at_base_false_with_untracked_file_in_new_directory(self):
++        (self.worktree / 'sub').mkdir()
++        (self.worktree / 'sub/new.txt').write_text('x')
++        self.assertFalse(selfcheck.at_base(self.root, 'demo', self.worktree))
++
++    def test_at_base_false_after_new_commit(self):
++        (self.worktree / 'tracked.txt').write_text('changed\n')
++        self.git(self.worktree, 'add', 'tracked.txt')
++        self.git(self.worktree, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'work')
++        self.assertFalse(selfcheck.at_base(self.root, 'demo', self.worktree))
++
++    def test_at_base_false_when_state_unreadable_or_without_base(self):
++        self.state.write_text('{not json')
++        self.assertFalse(selfcheck.at_base(self.root, 'demo', self.worktree))
++        self.state.write_text(json.dumps({'task_id': 'demo'}))
++        self.assertFalse(selfcheck.at_base(self.root, 'demo', self.worktree))
++        self.assertFalse(selfcheck.at_base(self.root, 'absent', self.worktree))
++
++    def test_run_records_event_and_returns_code(self):
++        task = {'id': 'demo', 'acceptance': ['hidden.py'], 'acceptance_verify': 'python3 hidden.py'}
++        seen = []
++        original = selfcheck.breaker.run_acceptance
++        self.addCleanup(setattr, selfcheck.breaker, 'run_acceptance', original)
++        for code in (0, 2):
++            selfcheck.breaker.run_acceptance = lambda *args, code=code: seen.append(args) or (code, 'feedback')
++            self.assertEqual(selfcheck.run(self.root, task, self.worktree, 'execute'), code)
++        self.assertEqual(seen[0], (task, self.root, self.worktree, 'execute', True))
++        recorded = [e for e in events.read(self.root, task_id='demo') if e['event'] == 'selfcheck']
++        self.assertEqual([e['detail'] for e in recorded], [{'code': 0}, {'code': 2}])
++
++    def prepare_selfcheck(self, code, hidden=True):
++        (self.root / 'scripts').mkdir(exist_ok=True)
++        sandbox = self.root / 'scripts/sandbox.sh'
++        sandbox.write_text('#!/bin/sh\necho "$@" >> "$(dirname "$0")/sandbox.log"\n')
++        sandbox.chmod(0o755)
++        self.state.write_text(json.dumps({'task_id': 'demo', 'base_commit': self.base, 'worktree': 'wt',
++                                          'source_task': 'demo.md'}))
++        (self.root / 'demo.md').write_text('---\n---\n')
++        task = {'id': 'demo'}
++        patches = [mock.patch.object(selfcheck, 'read_task', return_value=task),
++                   mock.patch.object(selfcheck.breaker, 'has_acceptance', return_value=hidden),
++                   mock.patch.object(selfcheck, 'run', return_value=code)]
++        for patch in patches:
++            patch.start()
++            self.addCleanup(patch.stop)
++        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
++            result = selfcheck.prepare_selfcheck(self.root, 'demo')
++        calls = (self.root / 'scripts/sandbox.log').read_text().splitlines() if hidden else []
++        return result, out.getvalue(), err.getvalue(), calls
++
++    def test_prepare_selfcheck_vacuous_test_exits_3_and_stops_container(self):
++        result, out, err, calls = self.prepare_selfcheck(0)
++        self.assertEqual(result, 3)
++        self.assertIn(selfcheck.MESSAGE, err)
++        self.assertEqual(calls, ['start demo', 'stop demo'])
++
++    def test_prepare_selfcheck_failing_test_allows_delegation(self):
++        result, out, err, calls = self.prepare_selfcheck(1)
++        self.assertEqual(result, 0)
++        self.assertIn('selfcheck : le test caché échoue sur la base (code 1), délégation possible', out)
++        self.assertEqual(calls, ['start demo', 'stop demo'])
++
++    def test_prepare_selfcheck_without_hidden_test_does_not_start_container(self):
++        result, out, err, calls = self.prepare_selfcheck(0, hidden=False)
++        self.assertEqual(result, 0)
++        self.assertFalse((self.root / 'scripts/sandbox.log').exists())
++
++    def test_message_names_the_outcome_and_the_override(self):
++        self.assertTrue(selfcheck.MESSAGE.startswith('acceptance_vacuous : '))
++        self.assertIn('WORKSPACE_NO_SELFCHECK=1', selfcheck.MESSAGE)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

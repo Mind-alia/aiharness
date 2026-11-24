@@ -1,0 +1,190 @@
+diff --git a/template/scripts/codex.sh b/template/scripts/codex.sh
+--- a/template/scripts/codex.sh
++++ b/template/scripts/codex.sh
+@@ -7,7 +7,7 @@
+ #   review: read-only sandbox, Codex can only read and report.
+ #   write:  workspace-write sandbox, Codex can edit files inside this project only.
+ # Events are kept in .workspace/run/codex/<timestamp>.jsonl (ignored by git).
+-# Exit codes: 0 success, 2 Codex failed, 3 Codex unavailable, 64 bad usage.
++# Exit codes: 0 success, 2 Codex failed, 3 Codex unavailable or a missing prerequisite, 64 bad usage.
+ set -u
+ mode=${1:-}; prompt=${2:-}; answer=${3:-}
+ # Resolve paths from the caller's directory before moving to the project root (C:\ or C:/ is absolute on Windows).
+@@ -22,6 +22,12 @@
+ esac
+ [ -f "$prompt" ] || { echo "prompt file not found: $prompt" >&2; exit 64; }
+ [ -n "$answer" ] || { echo "answer file missing" >&2; exit 64; }
++
++# Prerequisites are checked before anything is created or run.
++missing() { echo "codex.sh: prérequis manquant : $1" >&2; exit 3; }
++command -v python3 > /dev/null || missing python3
++[ -r "$prompt" ] || missing "fichier de consigne illisible : $prompt"
++command -v npx > /dev/null || missing npx
+ 
+ codex=(npx -y @openai/codex@0.162.1)
+ "${codex[@]}" --version > /dev/null 2>&1 || { echo "Codex CLI unavailable" >&2; exit 3; }
+diff --git a/template/scripts/gemini.sh b/template/scripts/gemini.sh
+--- a/template/scripts/gemini.sh
++++ b/template/scripts/gemini.sh
+@@ -6,7 +6,7 @@
+ #           commands (headless denies them), so the caller runs the verification itself.
+ # Model: GEMINI_MODEL (default gemini-3.8-flash-medium; see `agy models`). Time limit: GEMINI_TIMEOUT (default 600s).
+ # Events are kept in .workspace/run/gemini/<timestamp>.jsonl (ignored by git).
+-# Exit codes: 0 success, 2 Gemini failed, 3 Gemini unavailable, 64 bad usage.
++# Exit codes: 0 success, 2 Gemini failed, 3 Gemini unavailable or a missing prerequisite, 64 bad usage.
+ set -u
+ mode=${1:-}; prompt=${2:-}; answer=${3:-}
+ # Resolve paths from the caller's directory before moving to the project root (C:\ or C:/ is absolute on Windows).
+@@ -22,8 +22,12 @@
+ [ -f "$prompt" ] || { echo "prompt file not found: $prompt" >&2; exit 64; }
+ [ -n "$answer" ] || { echo "answer file missing" >&2; exit 64; }
+ 
++# Prerequisites are checked before anything is created or run.
++missing() { echo "gemini.sh: prérequis manquant : $1" >&2; exit 3; }
++command -v python3 > /dev/null || missing python3
++[ -r "$prompt" ] || missing "fichier de consigne illisible : $prompt"
+ agy="${AGY_BIN:-$HOME/.local/bin/agy}"
+-[ -x "$agy" ] || { echo "Antigravity CLI unavailable" >&2; exit 3; }
++[ -x "$agy" ] || missing "binaire agy introuvable : $agy"
+ 
+ mkdir -p .workspace/run/gemini "$(dirname "$answer")"
+ events=$(mktemp ".workspace/run/gemini/$(date +%Y%m%d-%H%M%S)-$mode-XXXXXX") || exit 2
+diff --git a/tests/test_relay_prereqs.py b/tests/test_relay_prereqs.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_relay_prereqs.py
+@@ -0,0 +1,128 @@
++import os
++from pathlib import Path
++import shlex
++import shutil
++import stat
++import subprocess
++import sys
++import tempfile
++import unittest
++
++TEMPLATE = Path(__file__).resolve().parents[1] / 'template/scripts'
++RELAYS = ('codex.sh', 'gemini.sh')
++# Tools the relays call before the prerequisite check or in the happy path, reachable through a reduced PATH.
++WRAPPED_TOOLS = ('dirname', 'mkdir', 'date', 'mktemp', 'mv', 'cat', 'tail')
++BASH = shutil.which('bash')
++PYTHON = sys.executable
++IS_ROOT = hasattr(os, 'geteuid') and os.geteuid() == 0
++
++
++def write_executable(path, body):
++    path.write_text('#!/bin/sh\n' + body + '\n')
++    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
++
++
++class RelayPrereqTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.project = Path(self.tmp.name) / 'project'
++        self.bin = Path(self.tmp.name) / 'bin'
++        self.calls = Path(self.tmp.name) / 'calls.log'
++        self.project.mkdir()
++        self.bin.mkdir()
++        (self.project / 'scripts').mkdir()
++        for name in RELAYS:
++            shutil.copy(TEMPLATE / name, self.project / 'scripts' / name)
++            (self.project / 'scripts' / name).chmod(0o755)
++        self.prompt = self.project / 'prompt.md'
++        self.prompt.write_text('consigne\n')
++        self.agy = self.bin.parent / 'fake-agy'
++        self.fake_tool(self.agy)
++        self.fake_tool(self.bin / 'npx')
++        self.link_tools()
++
++    def fake_tool(self, path):
++        write_executable(path, f'echo "{path.name} $*" >> "{self.calls}"\nexit 0')
++
++    def link_tools(self):
++        # Wrappers instead of symlinks: the repository must not contain links.
++        for name in WRAPPED_TOOLS:
++            real = shutil.which(name)
++            write_executable(self.bin / name, f'exec {shlex.quote(real)} "$@"')
++        write_executable(self.bin / 'python3', f'exec {shlex.quote(PYTHON)} "$@"')
++
++    def remove_tool(self, name):
++        (self.bin / name).unlink()
++
++    def run_relay(self, name, *args, env_extra=None, path=None):
++        env = {'PATH': path if path is not None else str(self.bin)}
++        if name == 'gemini.sh':
++            env['AGY_BIN'] = str(self.agy)
++        env.update(env_extra or {})
++        return subprocess.run([BASH, str(self.project / 'scripts' / name), *args],
++                              cwd=str(self.project), env=env, stdin=subprocess.DEVNULL,
++                              capture_output=True, text=True)
++
++    def assert_single_line_missing(self, result, name, what):
++        self.assertEqual(result.returncode, 3, result.stderr)
++        self.assertEqual(result.stderr, f'{name}: prérequis manquant : {what}\n')
++        self.assertEqual(result.stdout, '')
++        self.assertFalse((self.project / '.workspace').exists())
++        self.assertFalse(self.calls.exists())
++
++    def test_unknown_mode_is_bad_usage_even_without_python(self):
++        self.remove_tool('python3')
++        for name in RELAYS:
++            with self.subTest(relay=name):
++                result = self.run_relay(name, 'bogus', str(self.prompt), 'out.md')
++                self.assertEqual(result.returncode, 64, result.stderr)
++                self.assertFalse((self.project / '.workspace').exists())
++                self.assertFalse(self.calls.exists())
++
++    def test_missing_python_is_reported_before_anything_runs(self):
++        self.remove_tool('python3')
++        for name in RELAYS:
++            with self.subTest(relay=name):
++                result = self.run_relay(name, 'write', str(self.prompt), 'out.md')
++                self.assert_single_line_missing(result, name, 'python3')
++
++    def test_missing_python_is_named_first_when_other_prerequisites_are_missing(self):
++        self.remove_tool('python3')
++        self.remove_tool('npx')
++        result = self.run_relay('codex.sh', 'write', str(self.prompt), 'out.md')
++        self.assert_single_line_missing(result, 'codex.sh', 'python3')
++
++    def test_missing_npx_is_reported_for_codex(self):
++        self.remove_tool('npx')
++        result = self.run_relay('codex.sh', 'review', str(self.prompt), 'out.md')
++        self.assert_single_line_missing(result, 'codex.sh', 'npx')
++
++    def test_missing_agy_binary_is_reported_with_its_path(self):
++        self.agy.unlink()
++        result = self.run_relay('gemini.sh', 'review', str(self.prompt), 'out.md')
++        self.assert_single_line_missing(result, 'gemini.sh', f'binaire agy introuvable : {self.agy}')
++
++    @unittest.skipIf(IS_ROOT, 'root can read files without the read permission')
++    def test_unreadable_prompt_is_reported_as_unavailable_not_bad_usage(self):
++        for name in RELAYS:
++            with self.subTest(relay=name):
++                self.prompt.chmod(0o000)
++                self.addCleanup(self.prompt.chmod, 0o644)
++                result = self.run_relay(name, 'review', str(self.prompt), 'out.md')
++                self.assert_single_line_missing(
++                    result, name, f'fichier de consigne illisible : {self.prompt}')
++
++    def test_all_prerequisites_present_reaches_the_relay_binary(self):
++        cases = (('codex.sh', 'npx'), ('gemini.sh', 'fake-agy'))
++        for name, binary in cases:
++            with self.subTest(relay=name):
++                if self.calls.exists():
++                    self.calls.unlink()
++                result = self.run_relay(name, 'review', str(self.prompt), 'out.md')
++                self.assertNotEqual(result.returncode, 3, result.stderr)
++                self.assertIn(f'{binary} ', self.calls.read_text())
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

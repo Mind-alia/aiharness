@@ -1,0 +1,550 @@
+diff --git a/template/scripts/lib/mission.py b/template/scripts/lib/mission.py
+--- a/template/scripts/lib/mission.py
++++ b/template/scripts/lib/mission.py
+@@ -34,186 +34,8 @@
+ from isolation import choose_isolation
+ from secrets import known_values, mask_secrets
+ from scope import matches
+-
+-SENSITIVE_PATHS = [
+-    '.git',
+-    '.git/config',
+-    '.git/HEAD',
+-    '.workspace',
+-    '.workspace/orchestration',
+-    '.workspace/worktrees',
+-    'scripts/gate.sh',
+-    'scripts/check-scope.sh',
+-    'scripts/scope-baseline.sh',
+-    'scripts/verify-task.sh',
+-    'scripts/docs-check.sh',
+-    'scripts/check-secret-tracing.sh',
+-    'scripts/lib/task.py',
+-    'scripts/lib/scope.py',
+-    'scripts/lib/secrets.py',
+-    'scripts/lib/output.py',
+-    'scripts/lib/mission.py',
+-    '.env',
+-    '.env.local',
+-    '.env.production',
+-    'secrets/key',
+-    'secrets/token.txt',
+-    'cert.key',
+-]
+-
+-
+-def remove_prefix(text: str, prefix: str) -> str:
+-    if text.startswith(prefix):
+-        return text[len(prefix):]
+-    return text
+-
+-
+-def is_relative_to_path(path: Path, base: Path) -> bool:
+-    try:
+-        path.resolve().relative_to(base.resolve())
+-        return True
+-    except ValueError:
+-        return False
+-
+-
+-def is_sensitive_pattern(pattern: str) -> bool:
+-    if not isinstance(pattern, str):
+-        return True
+-    stripped = pattern.strip()
+-    if not stripped or stripped in ('.', './', '/'):
+-        return True
+-    clean = remove_prefix(stripped, './').strip('/')
+-    if not clean or clean in ('.', '/', '*', '**'):
+-        return True
+-
+-    parts = [p for p in clean.split('/') if p and p != '.']
+-    if not parts or any(p in ('.', '..') for p in parts):
+-        return True
+-
+-    if clean in ('*', '**') or parts[0] in ('*', '**'):
+-        return True
+-
+-    # Protéger .git, .workspace et scripts dès la racine
+-    if parts[0] in ('.git', '.workspace', 'scripts') or any(p in ('.git', '.workspace') for p in parts):
+-        return True
+-
+-    # Secrets and env files at any depth (excluding inside node_modules)
+-    if 'node_modules' not in parts:
+-        if 'secrets' in parts:
+-            return True
+-        if any(p.startswith('.env') for p in parts):
+-            return True
+-        if any(p.endswith('.key') for p in parts):
+-            return True
+-
+-    for sp in SENSITIVE_PATHS:
+-        try:
+-            if matches(sp, clean) or matches(clean, sp) or patterns_overlap(clean, sp):
+-                return True
+-        except Exception:
+-            pass
+-    return False
+-
+-
+-def validate_allowed_patterns(root: Path, allowed: List[str]) -> None:
+-    if not isinstance(allowed, list) or not allowed:
+-        raise ValueError("Le périmètre allowed doit être une liste non vide de motifs.")
+-    for pattern in allowed:
+-        if not isinstance(pattern, str) or not pattern.strip():
+-            raise ValueError("Motif allowed vide ou invalide.")
+-        stripped = pattern.strip()
+-        if stripped in ('.', './', '/'):
+-            raise ValueError(f"Motif racine ou vide interdit dans le périmètre allowed : {pattern}")
+-        if pattern.startswith('/') or pattern.startswith('\\'):
+-            raise ValueError(f"Chemin absolu interdit dans le périmètre allowed : {pattern}")
+-        parts = remove_prefix(stripped, './').split('/')
+-        if '..' in parts:
+-            raise ValueError(f"Traversée de chemin (..) interdite dans le périmètre allowed : {pattern}")
+-        if is_sensitive_pattern(pattern):
+-            raise ValueError(f"Périmètre sensible ou interdit dans allowed : {pattern}")
+-        curr = root
+-        for part in parts:
+-            if any(char in part for char in '*?[]'):
+-                break
+-            curr = curr / part
+-            if curr.is_symlink():
+-                try:
+-                    target = curr.resolve()
+-                    if not is_relative_to_path(target, root):
+-                        raise ValueError(f"Lien symbolique (symlink) sortant interdit dans allowed : {pattern}")
+-                except (OSError, ValueError) as exc:
+-                    raise ValueError(f"Lien symbolique (symlink) sortant interdit dans allowed : {pattern}") from exc
+-
+-
+-def check_path_security(path: Path, root: Path, label: str = "fichier de tâche") -> None:
+-    if not is_relative_to_path(path, root):
+-        raise ValueError(f"Le {label} pointe hors de la racine du projet (lien symbolique sortant ou chemin externe).")
+-    curr = path
+-    while True:
+-        if curr.is_symlink():
+-            raise ValueError(f"Lien symbolique (symlink) interdit pour le {label} : {curr}")
+-        if curr == root or curr == curr.parent:
+-            break
+-        curr = curr.parent
+-
+-
+-def check_infrastructure_symlinks(root: Path) -> None:
+-    for rel in (
+-        '.workspace',
+-        '.workspace/orchestration',
+-        '.workspace/orchestration/.lock',
+-        '.workspace/orchestration/tasks',
+-        '.workspace/worktrees'
+-    ):
+-        p = root / rel
+-        if p.is_symlink():
+-            raise ValueError(f"Lien symbolique (symlink) interdit dans l'infrastructure : {p}")
+-        if p.exists():
+-            for parent in (p, *p.parents):
+-                if parent == root:
+-                    break
+-                if parent.is_symlink():
+-                    raise ValueError(f"Lien symbolique (symlink) interdit dans l'infrastructure : {parent}")
+-
+-
+-def patterns_overlap(pat1: str, pat2: str) -> bool:
+-    p1 = remove_prefix(pat1.strip(), './').strip('/')
+-    p2 = remove_prefix(pat2.strip(), './').strip('/')
+-    if p1 == p2:
+-        return True
+-
+-    try:
+-        if matches(p1, p2) or matches(p2, p1):
+-            return True
+-    except Exception:
+-        pass
+-
+-    parts1 = [p for p in p1.split('/') if p]
+-    parts2 = [p for p in p2.split('/') if p]
+-
+-    def segments_could_match(s1: str, s2: str) -> bool:
+-        if s1 == s2 or s1 == '*' or s2 == '*':
+-            return True
+-        if fnmatch.fnmatchcase(s1, s2) or fnmatch.fnmatchcase(s2, s1):
+-            return True
+-        if any(c in s1 for c in '*?[]') and any(c in s2 for c in '*?[]'):
+-            return True
+-        return False
+-
+-    i = 0
+-    while i < len(parts1) and i < len(parts2):
+-        s1, s2 = parts1[i], parts2[i]
+-        if s1 == '**' or s2 == '**':
+-            return True
+-        if not segments_could_match(s1, s2):
+-            return False
+-        i += 1
+-
+-    # If all segments of one pattern matched the prefix of the other pattern,
+-    # the shorter pattern represents an ancestor directory/parent scope containing the child,
+-    # so they overlap and must never be considered disjoint.
+-    return True
+-
++from mission_rules import SENSITIVE_PATHS, remove_prefix, is_relative_to_path, is_sensitive_pattern, validate_allowed_patterns, check_path_security, check_infrastructure_symlinks, patterns_overlap
++from mission_git import run_git, verify_git_root, verify_git_head_and_clean, resolve_base_commit, prevalidate_branch_and_worktree
+ 
+ KNOWN_STATUSES = {'prepared', 'running', 'integrated', 'rejected', 'failed', 'abandoned', 'merged', 'merge_conflict', 'integration_failed', 'done'}
+ 
+@@ -286,76 +108,6 @@
+                             f"Conflit de réservation : le motif '{p_new}' chevauche le périmètre "
+                             f"de la tâche active '{registered_id}' ('{p_reg}')."
+                         )
+-
+-
+-def run_git(root: Path, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
+-    cmd = [
+-        'git',
+-        '-c', 'core.hooksPath=',
+-        '-C', str(root),
+-        *args
+-    ]
+-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+-    if check and res.returncode != 0:
+-        raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
+-    return res
+-
+-
+-def verify_git_root(root: Path) -> None:
+-    res = run_git(root, ['rev-parse', '--show-toplevel'], check=False)
+-    if res.returncode != 0:
+-        raise ValueError("Le projet n'est pas un dépôt Git valide.")
+-    toplevel = Path(res.stdout.strip()).resolve()
+-    if toplevel != root.resolve():
+-        raise ValueError(
+-            f"La racine indiquée ({root}) ne correspond pas à la racine exacte du dépôt Git ({toplevel})."
+-        )
+-
+-
+-def verify_git_head_and_clean(root: Path) -> str:
+-    res_head = run_git(root, ['rev-parse', '--verify', 'HEAD'], check=False)
+-    if res_head.returncode != 0:
+-        raise ValueError("Dépôt Git sans commit HEAD (dépôt vide ou branche initiale sans aucun commit).")
+-    head_commit = res_head.stdout.strip()
+-
+-    res_status = run_git(root, ['status', '--porcelain=v1'], check=False)
+-    if res_status.returncode != 0:
+-        raise ValueError("Impossible de vérifier l'état de l'arbre Git.")
+-    if res_status.stdout.strip():
+-        raise ValueError("L'arbre de travail Git principal n'est pas propre (modifications non validées ou fichiers non suivis présents).")
+-
+-    return head_commit
+-
+-
+-def resolve_base_commit(root: Path, base_ref: Optional[str], head_commit: str) -> str:
+-    if not base_ref:
+-        return head_commit
+-
+-    if base_ref.startswith('-'):
+-        raise ValueError(f"Référence de base invalide (option interdite) : {base_ref}")
+-
+-    res = run_git(root, ['rev-parse', '--verify', '--quiet', '--end-of-options', f'{base_ref}^{{commit}}'], check=False)
+-    if res.returncode != 0:
+-        raise ValueError(f"Référence de base invalide ou introuvable : {base_ref}")
+-    return res.stdout.strip()
+-
+-
+-def prevalidate_branch_and_worktree(root: Path, task_id: str) -> Tuple[str, Path, Path]:
+-    branch_name = f"workspace-task/{task_id}"
+-    worktree_path = root / '.workspace/worktrees' / task_id
+-    state_file = root / '.workspace/orchestration/tasks' / task_id / 'state.json'
+-
+-    res = run_git(root, ['rev-parse', '--verify', '--quiet', '--end-of-options', f'refs/heads/{branch_name}'], check=False)
+-    if res.returncode == 0:
+-        raise ValueError(f"La branche {branch_name} existe déjà (collision).")
+-
+-    if worktree_path.exists() or worktree_path.is_symlink():
+-        raise ValueError(f"Le chemin cible de worktree existe déjà : {worktree_path}")
+-
+-    if state_file.exists() or state_file.is_symlink():
+-        raise ValueError(f"Un état existe déjà pour la tâche : {task_id}")
+-
+-    return branch_name, worktree_path, state_file
+ 
+ 
+ def cmd_prepare(root: Path, task_file_arg: str, base_ref: Optional[str], caller_cwd: Path) -> int:
+diff --git a/template/scripts/lib/mission_git.py b/template/scripts/lib/mission_git.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/mission_git.py
+@@ -0,0 +1,77 @@
++"""Aides Git pour mission.py.
++
++Python 3.9+ standard library uniquement.
++"""
++from pathlib import Path
++import subprocess
++from typing import List, Optional, Tuple
++
++
++def run_git(root: Path, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
++    cmd = [
++        'git',
++        '-c', 'core.hooksPath=',
++        '-C', str(root),
++        *args
++    ]
++    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    if check and res.returncode != 0:
++        raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
++    return res
++
++
++def verify_git_root(root: Path) -> None:
++    res = run_git(root, ['rev-parse', '--show-toplevel'], check=False)
++    if res.returncode != 0:
++        raise ValueError("Le projet n'est pas un dépôt Git valide.")
++    toplevel = Path(res.stdout.strip()).resolve()
++    if toplevel != root.resolve():
++        raise ValueError(
++            f"La racine indiquée ({root}) ne correspond pas à la racine exacte du dépôt Git ({toplevel})."
++        )
++
++
++def verify_git_head_and_clean(root: Path) -> str:
++    res_head = run_git(root, ['rev-parse', '--verify', 'HEAD'], check=False)
++    if res_head.returncode != 0:
++        raise ValueError("Dépôt Git sans commit HEAD (dépôt vide ou branche initiale sans aucun commit).")
++    head_commit = res_head.stdout.strip()
++
++    res_status = run_git(root, ['status', '--porcelain=v1'], check=False)
++    if res_status.returncode != 0:
++        raise ValueError("Impossible de vérifier l'état de l'arbre Git.")
++    if res_status.stdout.strip():
++        raise ValueError("L'arbre de travail Git principal n'est pas propre (modifications non validées ou fichiers non suivis présents).")
++
++    return head_commit
++
++
++def resolve_base_commit(root: Path, base_ref: Optional[str], head_commit: str) -> str:
++    if not base_ref:
++        return head_commit
++
++    if base_ref.startswith('-'):
++        raise ValueError(f"Référence de base invalide (option interdite) : {base_ref}")
++
++    res = run_git(root, ['rev-parse', '--verify', '--quiet', '--end-of-options', f'{base_ref}^{{commit}}'], check=False)
++    if res.returncode != 0:
++        raise ValueError(f"Référence de base invalide ou introuvable : {base_ref}")
++    return res.stdout.strip()
++
++
++def prevalidate_branch_and_worktree(root: Path, task_id: str) -> Tuple[str, Path, Path]:
++    branch_name = f"workspace-task/{task_id}"
++    worktree_path = root / '.workspace/worktrees' / task_id
++    state_file = root / '.workspace/orchestration/tasks' / task_id / 'state.json'
++
++    res = run_git(root, ['rev-parse', '--verify', '--quiet', '--end-of-options', f'refs/heads/{branch_name}'], check=False)
++    if res.returncode == 0:
++        raise ValueError(f"La branche {branch_name} existe déjà (collision).")
++
++    if worktree_path.exists() or worktree_path.is_symlink():
++        raise ValueError(f"Le chemin cible de worktree existe déjà : {worktree_path}")
++
++    if state_file.exists() or state_file.is_symlink():
++        raise ValueError(f"Un état existe déjà pour la tâche : {task_id}")
++
++    return branch_name, worktree_path, state_file
+diff --git a/template/scripts/lib/mission_rules.py b/template/scripts/lib/mission_rules.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/mission_rules.py
+@@ -0,0 +1,188 @@
++"""Règles de périmètre et de sécurité des chemins pour mission.py.
++
++Python 3.9+ standard library uniquement.
++"""
++import fnmatch
++from pathlib import Path
++from typing import List
++
++from scope import matches
++
++SENSITIVE_PATHS = [
++    '.git',
++    '.git/config',
++    '.git/HEAD',
++    '.workspace',
++    '.workspace/orchestration',
++    '.workspace/worktrees',
++    'scripts/gate.sh',
++    'scripts/check-scope.sh',
++    'scripts/scope-baseline.sh',
++    'scripts/verify-task.sh',
++    'scripts/docs-check.sh',
++    'scripts/check-secret-tracing.sh',
++    'scripts/lib/task.py',
++    'scripts/lib/scope.py',
++    'scripts/lib/secrets.py',
++    'scripts/lib/output.py',
++    'scripts/lib/mission.py',
++    '.env',
++    '.env.local',
++    '.env.production',
++    'secrets/key',
++    'secrets/token.txt',
++    'cert.key',
++]
++
++
++def remove_prefix(text: str, prefix: str) -> str:
++    if text.startswith(prefix):
++        return text[len(prefix):]
++    return text
++
++
++def is_relative_to_path(path: Path, base: Path) -> bool:
++    try:
++        path.resolve().relative_to(base.resolve())
++        return True
++    except ValueError:
++        return False
++
++
++def is_sensitive_pattern(pattern: str) -> bool:
++    if not isinstance(pattern, str):
++        return True
++    stripped = pattern.strip()
++    if not stripped or stripped in ('.', './', '/'):
++        return True
++    clean = remove_prefix(stripped, './').strip('/')
++    if not clean or clean in ('.', '/', '*', '**'):
++        return True
++
++    parts = [p for p in clean.split('/') if p and p != '.']
++    if not parts or any(p in ('.', '..') for p in parts):
++        return True
++
++    if clean in ('*', '**') or parts[0] in ('*', '**'):
++        return True
++
++    # Protéger .git, .workspace et scripts dès la racine
++    if parts[0] in ('.git', '.workspace', 'scripts') or any(p in ('.git', '.workspace') for p in parts):
++        return True
++
++    # Secrets and env files at any depth (excluding inside node_modules)
++    if 'node_modules' not in parts:
++        if 'secrets' in parts:
++            return True
++        if any(p.startswith('.env') for p in parts):
++            return True
++        if any(p.endswith('.key') for p in parts):
++            return True
++
++    for sp in SENSITIVE_PATHS:
++        try:
++            if matches(sp, clean) or matches(clean, sp) or patterns_overlap(clean, sp):
++                return True
++        except Exception:
++            pass
++    return False
++
++
++def validate_allowed_patterns(root: Path, allowed: List[str]) -> None:
++    if not isinstance(allowed, list) or not allowed:
++        raise ValueError("Le périmètre allowed doit être une liste non vide de motifs.")
++    for pattern in allowed:
++        if not isinstance(pattern, str) or not pattern.strip():
++            raise ValueError("Motif allowed vide ou invalide.")
++        stripped = pattern.strip()
++        if stripped in ('.', './', '/'):
++            raise ValueError(f"Motif racine ou vide interdit dans le périmètre allowed : {pattern}")
++        if pattern.startswith('/') or pattern.startswith('\\'):
++            raise ValueError(f"Chemin absolu interdit dans le périmètre allowed : {pattern}")
++        parts = remove_prefix(stripped, './').split('/')
++        if '..' in parts:
++            raise ValueError(f"Traversée de chemin (..) interdite dans le périmètre allowed : {pattern}")
++        if is_sensitive_pattern(pattern):
++            raise ValueError(f"Périmètre sensible ou interdit dans allowed : {pattern}")
++        curr = root
++        for part in parts:
++            if any(char in part for char in '*?[]'):
++                break
++            curr = curr / part
++            if curr.is_symlink():
++                try:
++                    target = curr.resolve()
++                    if not is_relative_to_path(target, root):
++                        raise ValueError(f"Lien symbolique (symlink) sortant interdit dans allowed : {pattern}")
++                except (OSError, ValueError) as exc:
++                    raise ValueError(f"Lien symbolique (symlink) sortant interdit dans allowed : {pattern}") from exc
++
++
++def check_path_security(path: Path, root: Path, label: str = "fichier de tâche") -> None:
++    if not is_relative_to_path(path, root):
++        raise ValueError(f"Le {label} pointe hors de la racine du projet (lien symbolique sortant ou chemin externe).")
++    curr = path
++    while True:
++        if curr.is_symlink():
++            raise ValueError(f"Lien symbolique (symlink) interdit pour le {label} : {curr}")
++        if curr == root or curr == curr.parent:
++            break
++        curr = curr.parent
++
++
++def check_infrastructure_symlinks(root: Path) -> None:
++    for rel in (
++        '.workspace',
++        '.workspace/orchestration',
++        '.workspace/orchestration/.lock',
++        '.workspace/orchestration/tasks',
++        '.workspace/worktrees'
++    ):
++        p = root / rel
++        if p.is_symlink():
++            raise ValueError(f"Lien symbolique (symlink) interdit dans l'infrastructure : {p}")
++        if p.exists():
++            for parent in (p, *p.parents):
++                if parent == root:
++                    break
++                if parent.is_symlink():
++                    raise ValueError(f"Lien symbolique (symlink) interdit dans l'infrastructure : {parent}")
++
++
++def patterns_overlap(pat1: str, pat2: str) -> bool:
++    p1 = remove_prefix(pat1.strip(), './').strip('/')
++    p2 = remove_prefix(pat2.strip(), './').strip('/')
++    if p1 == p2:
++        return True
++
++    try:
++        if matches(p1, p2) or matches(p2, p1):
++            return True
++    except Exception:
++        pass
++
++    parts1 = [p for p in p1.split('/') if p]
++    parts2 = [p for p in p2.split('/') if p]
++
++    def segments_could_match(s1: str, s2: str) -> bool:
++        if s1 == s2 or s1 == '*' or s2 == '*':
++            return True
++        if fnmatch.fnmatchcase(s1, s2) or fnmatch.fnmatchcase(s2, s1):
++            return True
++        if any(c in s1 for c in '*?[]') and any(c in s2 for c in '*?[]'):
++            return True
++        return False
++
++    i = 0
++    while i < len(parts1) and i < len(parts2):
++        s1, s2 = parts1[i], parts2[i]
++        if s1 == '**' or s2 == '**':
++            return True
++        if not segments_could_match(s1, s2):
++            return False
++        i += 1
++
++    # If all segments of one pattern matched the prefix of the other pattern,
++    # the shorter pattern represents an ancestor directory/parent scope containing the child,
++    # so they overlap and must never be considered disjoint.
++    return True
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

@@ -1,0 +1,95 @@
+diff --git a/tests/test_task_workspace.py b/tests/test_task_workspace.py
+--- a/tests/test_task_workspace.py
++++ b/tests/test_task_workspace.py
+@@ -690,6 +690,91 @@
+         self.assertIn('corrompu', result.stderr)
+         self.assertTrue(worktree.exists())
+ 
++    def make_arm(self):
++        """Linked worktree of the project used as root, like a campaign arm."""
++        for name in ('verify-task.sh', 'sandbox.sh'):
++            shutil.copy2(ROOT / 'template/scripts' / name, self.scripts_dir / name)
++        self.git('config', 'user.name', 'Test')
++        self.git('config', 'user.email', 'test@example.invalid')
++        self.git('add', 'scripts')
++        self.git('commit', '-qm', 'verification tooling')
++        arm =self.root / '.workspace/campaign/arm'
++        self.git('worktree', 'add', '-q', '-b', 'arm-branch', str(arm))
++        self.assertTrue((arm / '.git').is_file())
++        return arm
++
++    def run_arm(self, arm, *args):
++        return subprocess.run(['bash', str(arm / 'scripts/task-workspace.sh'), *args],
++                              cwd=str(arm), capture_output=True, text=True)
++
++    def prepare_arm_task(self, arm):
++        task = arm / 'tasks/task-1.md'
++        task.parent.mkdir(parents=True, exist_ok=True)
++        task.write_text("---\nid: task-1\nagent: codex\nallowed:\n  - src/**\n"
++                        "verify: test -f src/app.py\nverify_profile: off\nisolation: none\n"
++                        "---\n# feat: nouvelle fonction\nSuite\n", encoding='utf-8')
++        result = self.run_arm(arm, 'prepare', str(task))
++        self.assertEqual(result.returncode, 0, result.stderr)
++        return arm / '.workspace/worktrees/task-1'
++
++    def point_git_file_to_other_repository(self, worktree):
++        other = Path(self.temp.name) / 'other repository'
++        other.mkdir()
++        self.git('init', '-q', cwd=other)
++        (other / 'file.txt').write_text('other\n')
++        self.git('add', '.', cwd=other)
++        self.git('commit', '-qm', 'other initial', cwd=other)
++        foreign = Path(self.temp.name) / 'foreign worktree'
++        self.git('worktree', 'add', '-q', '-b', 'foreign', str(foreign), cwd=other)
++        shutil.copy2(foreign / '.git', worktree / '.git')
++
++    def test_prepare_and_merge_when_root_is_linked_worktree(self):
++        arm = self.make_arm()
++        main_head = self.git('rev-parse', 'HEAD').strip()
++        main_branch = self.git('symbolic-ref', 'HEAD').strip()
++        worktree = self.prepare_arm_task(arm)
++        self.assertEqual(worktree, arm / '.workspace/worktrees/task-1')
++        (worktree / 'src/app.py').write_text('changed\n')
++        self.git('add', '.', cwd=worktree)
++        self.git('commit', '-qm', 'feat: task', cwd=worktree)
++        result = self.run_arm(arm, 'merge', 'task-1')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual((arm / 'src/app.py').read_text(), 'changed\n')
++        self.assertEqual(self.git('log', '-1', '--format=%s', cwd=arm).strip(), 'merge: task task-1')
++        self.assertFalse(worktree.exists())
++        state = json.loads((arm / '.workspace/orchestration/tasks/task-1/state.json').read_text())
++        self.assertEqual(state['status'], 'merged')
++        self.assertNotIn('refs/heads/workspace-task/task-1', self.git('show-ref'))
++        self.assertEqual(self.git('rev-parse', 'HEAD').strip(), main_head)
++        self.assertEqual(self.git('symbolic-ref', 'HEAD').strip(), main_branch)
++        self.assertEqual((self.root / 'src/app.py').read_text(), 'print("initial")\n')
++
++    def test_close_abandoned_when_root_is_linked_worktree(self):
++        arm = self.make_arm()
++        worktree = self.prepare_arm_task(arm)
++        result = self.run_arm(arm, 'close', 'task-1', '--abandoned')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertFalse(worktree.exists())
++        self.git('rev-parse', '--verify', 'refs/heads/workspace-task/task-1')
++
++    def test_close_refuses_foreign_git_metadata(self):
++        worktree = self.prepare_close_task()
++        self.point_git_file_to_other_repository(worktree)
++        result = self.run_cli('close', 'task-1', '--abandoned', '--force')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertTrue(worktree.exists())
++        self.assertEqual(self.close_state()['status'], 'prepared')
++
++    def test_close_refuses_foreign_git_metadata_when_root_is_linked_worktree(self):
++        arm = self.make_arm()
++        worktree = self.prepare_arm_task(arm)
++        self.point_git_file_to_other_repository(worktree)
++        result = self.run_arm(arm, 'close', 'task-1', '--abandoned', '--force')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertTrue(worktree.exists())
++        state = json.loads((arm / '.workspace/orchestration/tasks/task-1/state.json').read_text())
++        self.assertEqual(state['status'], 'prepared')
++
+     def test_prepare_nominal_creates_branch_worktree_state(self):
+         self.write_task('tasks/task-1.md', 'task-1', 'codex', ['src/**'], body='Consigne secrète demo')
+         res = self.run_cli('prepare', 'tasks/task-1.md')

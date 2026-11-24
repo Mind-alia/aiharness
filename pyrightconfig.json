@@ -1,0 +1,7 @@
+{
+  "include": ["template/scripts/lib", "tools"],
+  "exclude": ["tools/campaign/etalons", "**/__pycache__"],
+  "extraPaths": ["template/scripts/lib"],
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.14"
+}

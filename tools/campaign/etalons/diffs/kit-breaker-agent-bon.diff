@@ -1,0 +1,148 @@
+diff --git a/tests/test_campaign.py b/tests/test_campaign.py
+--- a/tests/test_campaign.py
++++ b/tests/test_campaign.py
+@@ -494,3 +494,72 @@
+         self.assertIn('systeme-antigravity', result.stderr)
+         self.assertIn('docs/ANTIGRAVITY-SANS-INTERACTION.md', result.stderr)
+         self.assertFalse((self.base / 'results.jsonl').exists())
++
++    def breaker_commands(self, rows):
++        return [c['args'] for r in rows for c in r['commands'] if c['args'][1:2] == ['scripts/breaker.sh']]
++
++    def test_breaker_agent_defaults_to_codex_explicitly(self):
++        self.config.update(arms=['codex-seul', 'systeme-claude-haiku'], repetitions=1)
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual({r['arm']: r['breaker_agent'] for r in rows},
++                         {'codex-seul': None, 'systeme-claude-haiku': 'codex'})
++        commands = self.breaker_commands(rows)
++        self.assertEqual(len(commands), 2)  # le faux prepare-task crée deux contrats par bras système
++        for args in commands:
++            self.assertEqual(args[3:], ['--promote', '--agent', 'codex'])
++
++    def test_breaker_agent_string_applies_to_every_system_arm(self):
++        self.config.update(arms=['codex-seul', 'opus-seul', 'systeme-claude-haiku', 'systeme-codex'], repetitions=1)
++        self.config['breaker_agent'] = 'claude-sonnet'
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual({r['arm']: r['breaker_agent'] for r in rows},
++                         {'codex-seul': None, 'opus-seul': None,
++                          'systeme-claude-haiku': 'claude-sonnet', 'systeme-codex': 'claude-sonnet'})
++        commands = self.breaker_commands(rows)
++        self.assertEqual(len(commands), 4)  # deux contrats par bras système
++        for args in commands:
++            self.assertEqual(args[3:], ['--promote', '--agent', 'claude-sonnet'])
++
++    def test_breaker_agent_object_is_per_arm_and_missing_arm_keeps_codex(self):
++        self.config.update(arms=['codex-seul', 'systeme-claude-haiku', 'systeme-codex'], repetitions=1)
++        self.config['breaker_agent'] = {'systeme-claude-haiku': 'claude-opus'}
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual({r['arm']: r['breaker_agent'] for r in rows},
++                         {'codex-seul': None, 'systeme-claude-haiku': 'claude-opus', 'systeme-codex': 'codex'})
++        for row in rows:
++            used = [c['args'][-1] for c in row['commands'] if c['args'][1:2] == ['scripts/breaker.sh']]
++            self.assertEqual(used, [row['breaker_agent']] * 2 if row['breaker_agent'] else [])
++
++    def test_single_agent_arms_never_run_the_breaker(self):
++        self.config.update(arms=['codex-seul', 'opus-seul'], repetitions=1)
++        self.config['breaker_agent'] = 'claude-haiku'
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual([r['breaker_agent'] for r in rows], [None, None])
++        self.assertEqual(self.breaker_commands(rows), [])
++
++    def test_invalid_breaker_agent_is_refused_before_any_run(self):
++        self.config['arms'] = ['codex-seul', 'systeme-claude-haiku']
++        doc = 'docs/ANTIGRAVITY-SANS-INTERACTION.md'
++        cases = [('antigravity', 'antigravity', doc),
++                 ({'systeme-claude-haiku': 'antigravity'}, 'antigravity', doc),
++                 ({'systeme-codex': 'codex'}, 'bras inconnu', 'systeme-codex'),
++                 ({'systeme-claude-haiku': 'gpt'}, 'invalide', 'gpt'),
++                 ('gpt', 'invalide', 'gpt'),
++                 (7, 'doit être', 'breaker_agent'),
++                 (['codex'], 'doit être', 'breaker_agent'),
++                 ({'systeme-claude-haiku': 3}, 'invalide', '3'),
++                 (None, 'doit être', 'breaker_agent')]
++        for value, message, detail in cases:
++            with self.subTest(value=value):
++                self.config['breaker_agent'] = value
++                result = self.run_campaign()
++                self.assertEqual(result.returncode, 1, result.stderr)
++                self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
++                self.assertIn('campaign: breaker_agent', result.stderr)
++                self.assertIn(message, result.stderr)
++                self.assertIn(detail, result.stderr)
++                self.assertFalse((self.base / 'results.jsonl').exists())
+diff --git a/tools/campaign/campaign.py b/tools/campaign/campaign.py
+--- a/tools/campaign/campaign.py
++++ b/tools/campaign/campaign.py
+@@ -12,7 +12,10 @@
+ 
+ Fin du bras : `completed` retire le worktree (`git worktree remove`, sans --force ; s'il est sale il reste,
+ `arm_worktree_kept`). `failed`, `quota` et `interrupted` le gardent comme preuve, sauf `--discard-failed` qui le
+-retire avec --force. Chaque ligne porte `arm_worktree` (chemin absolu) et `arm_worktree_kept`. La branche reste."""
++retire avec --force. Chaque ligne porte `arm_worktree` (chemin absolu) et `arm_worktree_kept`. La branche reste.
++
++`breaker_agent` (facultatif) choisit l'exécutant du casseur des bras `systeme-*` : une chaîne pour tous, ou un objet
++`{bras: exécutant}` (un bras absent garde `codex`). Chaque ligne porte `breaker_agent`, `null` hors bras système."""
+ import hashlib
+ import json
+ import os
+@@ -34,6 +37,9 @@
+ 
+ class Quota(Exception):
+     pass
++
++
++BREAKER_AGENTS = ('codex', 'claude-haiku', 'claude-sonnet', 'claude-opus')
+ 
+ 
+ # « quota » seulement isolé : pas dans un identifiant, un chemin ou un champ JSON.
+@@ -101,10 +107,28 @@
+                 if not self.source(name).is_file():
+                     raise ValueError('Test absent : ' + name)
+             self.target(task['evaluation_target'])
++        chosen = self.config.get('breaker_agent', 'codex')
++        if not isinstance(chosen, (str, dict)):
++            raise ValueError('breaker_agent doit être un exécutant ou un objet {bras: exécutant}')
++        for arm, agent in (chosen.items() if isinstance(chosen, dict) else [(None, chosen)]):
++            if arm is not None and arm not in self.config['arms']:
++                raise ValueError('breaker_agent : bras inconnu : ' + arm)
++            if agent == 'antigravity':
++                raise ValueError('breaker_agent antigravity refusé : Antigravity ne lance aucune commande sans '
++                                 'interaction (docs/ANTIGRAVITY-SANS-INTERACTION.md)')
++            if not isinstance(agent, str) or agent not in BREAKER_AGENTS:
++                raise ValueError('breaker_agent invalide (%s) : %s' % (', '.join(BREAKER_AGENTS), json.dumps(agent)))
+         setup = self.config.get('setup')
+         if setup is not None and not (isinstance(setup, str) and setup or (
+                 isinstance(setup, list) and setup and all(isinstance(a, str) for a in setup))):
+             raise ValueError('setup doit être une commande ou une liste argv')
++
++    def breaker_agent(self, arm):
++        """Exécutant du casseur d'un bras `systeme-*` ; None pour les autres bras."""
++        if not arm.startswith('systeme-'):
++            return None
++        chosen = self.config.get('breaker_agent', 'codex')
++        return chosen.get(arm, 'codex') if isinstance(chosen, dict) else chosen
+ 
+     def target(self, name, base=None):
+         return evaluation_target(base or self.root, name)
+@@ -332,7 +356,7 @@
+             worktree = self.root / '.workspace/campaign' / uid
+             self.row = dict(task=task['id'], arm=arm, repetition=n, branch=branch, seed=seed,
+                             order=index, config_hash=fingerprint, start_commit=commit,
+-                            status='completed', attempts=0, breaker_retained=0, commands=[], consumption={})
++                            breaker_agent=self.breaker_agent(arm), status='completed', attempts=0, breaker_retained=0, commands=[], consumption={})
+             active = []
+             try:
+                 self.git('worktree', 'add', '-b', branch, str(worktree), commit, cwd=self.root)
+@@ -348,7 +372,7 @@
+                     system = arm.startswith('systeme-')
+                     self.delegate(task_id, system)
+                     if system:
+-                        self.script('breaker', task_id, '--promote')
++                        self.script('breaker', task_id, '--promote', '--agent', self.row['breaker_agent'])
+                         report = json.loads((self.work / '.workspace/breaker' / task_id / 'report.json').read_text())
+                         retained = len(report['retained'])
+                         self.row['breaker_retained'] += retained

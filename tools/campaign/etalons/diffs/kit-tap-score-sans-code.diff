@@ -1,0 +1,50 @@
+diff --git a/tests/test_campaign.py b/tests/test_campaign.py
+--- a/tests/test_campaign.py
++++ b/tests/test_campaign.py
+@@ -484,3 +484,13 @@
+         self.assertEqual(result.returncode, 1)
+         self.assertIn('setup', result.stderr)
+         self.assertFalse((self.base / 'results.jsonl').exists())
++
++    def test_antigravity_system_arm_is_refused_before_any_run(self):
++        self.config['arms'] = ['systeme-antigravity']
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 1)
++        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
++        self.assertIn('campaign: ', result.stderr)
++        self.assertIn('systeme-antigravity', result.stderr)
++        self.assertIn('docs/ANTIGRAVITY-SANS-INTERACTION.md', result.stderr)
++        self.assertFalse((self.base / 'results.jsonl').exists())
+diff --git a/tests/test_campaign_evaluation.py b/tests/test_campaign_evaluation.py
+--- a/tests/test_campaign_evaluation.py
++++ b/tests/test_campaign_evaluation.py
+@@ -7,6 +7,8 @@
+ import unittest
+ 
+ SCRIPT = Path(__file__).resolve().parents[1] / 'tools/campaign/evaluation.py'
++sys.path.insert(0, str(SCRIPT.parent))
++from evaluation import score
+ 
+ EVALUATION = '''import unittest
+ import calc
+@@ -222,5 +224,20 @@
+         self.assertEqual(list(outside.iterdir()), [])
+ 
+ 
++class ScoreTests(unittest.TestCase):
++    def test_nested_vitest_tap_counts_only_leaves(self):
++        leaves = ['    %s %d - test %d' % ('not ok' if n == 5 else 'ok', n, n) for n in range(1, 13)]
++        leaves.insert(5, '      ---\n      error: attendu 2')
++        output = '\n'.join(['TAP version 13', 'ok 1 - tests/calc.test.ts {', '  ok 1 - calc {'] + leaves
++                           + ['  }', '}', '1..1', ''])
++        self.assertEqual(score(output, 1), (11, 12))
++
++    def test_flat_tap_is_unchanged(self):
++        self.assertEqual(score('ok 1 - a\nnot ok 2 - b\nok 3 - c # SKIP\n', 1), (2, 3))
++
++    def test_group_lines_alone_are_unknown(self):
++        self.assertEqual(score('ok 1 - fichier.test.ts {\n    ok 1 - groupe {\n    }\n}\n', 0), (None, None))
++
++
+ if __name__ == '__main__':
+     unittest.main()

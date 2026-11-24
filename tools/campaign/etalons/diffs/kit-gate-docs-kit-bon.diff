@@ -1,0 +1,127 @@
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,4 +1,8 @@
+ # Règles pour travailler sur le kit Workspace IA
++
++docs-check: kit
++
++La ligne ci-dessus fait vérifier à `scripts/docs-check.sh` seulement ce mode kit : `AGENTS.md` (80 lignes au plus), `docs/LOG.md`, `docs/AMELIORATIONS.md` et `docs/QUESTIONS.md`.
+ 
+ Ce dépôt est le moteur : `template/` est copié dans chaque projet, `scripts/` est son miroir pour que le kit se pilote lui-même, `tests/` est la suite (Python 3.9, bibliothèque standard). Lire `README.md`, `docs/LOG.md` (dernières entrées) et `docs/AMELIORATIONS.md` (état par statut) avant de toucher au code.
+ 
+diff --git a/template/scripts/docs-check.sh b/template/scripts/docs-check.sh
+--- a/template/scripts/docs-check.sh
++++ b/template/scripts/docs-check.sh
+@@ -4,6 +4,16 @@
+ cd "$(dirname "$0")/.." || exit 2
+ fail=0
+ err() { echo "DOCS FAIL: $*"; fail=1; }
++
++# Kit mode: a project declaring `docs-check: kit` in AGENTS.md has no STATUS or plans, only these documents.
++if grep -qx 'docs-check: kit' AGENTS.md; then
++  [ "$(wc -l < AGENTS.md)" -le 80 ] || err "AGENTS.md longer than 80 lines"
++  for doc in docs/LOG.md docs/AMELIORATIONS.md docs/QUESTIONS.md; do
++    [ -f "$doc" ] || err "$doc missing"
++  done
++  [ $fail -eq 0 ] && echo "docs: OK"
++  exit $fail
++fi
+ 
+ # 1. ECC deterministic governance audit (links, roles, append-only log, delete-zone).
+ python3 .claude/skills/docs-governance/scripts/audit-docs.py --root . --scope full > .docs-audit.log 2>&1 || err "governance audit failed (see .docs-audit.log)"
+diff --git a/template/scripts/gate.sh b/template/scripts/gate.sh
+--- a/template/scripts/gate.sh
++++ b/template/scripts/gate.sh
+@@ -81,7 +81,10 @@
+     checks = [(name, ['make', name]) for name in (['check'] if quick else ['check', 'test'])]
+ elif profile == 'python':
+     checks = [] if quick else [('ruff', ['ruff', 'check', '.'])]
+-    checks.append(('pytest', ['pytest']))
++    if Path('tests/run.sh').is_file():
++        checks.append(('unittest', ['sh', 'tests/run.sh', 'fast' if quick else 'full']))
++    else:
++        checks.append(('pytest', ['pytest']))
+ else:
+     checks = []
+ if not quick or profile == 'docs':
+
+[TRUNCATED]
+diff --git a/tests/test_gate.py b/tests/test_gate.py
+--- a/tests/test_gate.py
++++ b/tests/test_gate.py
+@@ -327,3 +327,74 @@
+         result = self.run_script()
+         self.assertNotEqual(result.returncode, 0)
+         self.assertIn({'secrets': False}, [json.loads(line) for line in result.stdout.splitlines()])
++
++
++class KitGateTests(unittest.TestCase):
++    """Kit self-checks; no node needed, so they run in the sandbox too."""
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name) / 'kit'
++        self.scripts = self.root / 'scripts'
++        self.scripts.mkdir(parents=True)
++        for name in ('gate.sh', 'check-secret-tracing.sh'):
++            shutil.copy2(ROOT / 'template/scripts' / name, self.scripts / name)
++        (self.scripts / 'lib').mkdir()
++        for module in ('output.py', 'secrets.py'):
++            shutil.copy2(ROOT / 'template/scripts/lib' / module, self.scripts / 'lib' / module)
++        self.bin = Path(self.temp.name) / 'bin'
++        self.bin.mkdir()
++        self.log = self.root / 'calls'
++        self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'], CALLS=str(self.log))
++        self.fake('ruff')
++        (self.scripts / 'docs-check.sh').write_text('#!/bin/sh\necho docs >> "$CALLS"\n')
++        (self.root / 'project.profile').write_text('python\n')
++
++    def fake(self, name):
++        target = self.bin / name
++        target.write_text('#!/bin/sh\necho "' + name + ' $*" >> "$CALLS"\n')
++        target.chmod(0o755)
++
++    def run_script(self, name, *args):
++        return subprocess.run(['/bin/sh', str(self.scripts / name), *args],
++                              cwd=self.bin, env=self.env, capture_output=True, text=True)
++
++    def kit_docs(self, agents='docs-check: kit\n'):
++        shutil.copy2(ROOT / 'template/scripts/docs-check.sh', self.scripts / 'docs-check.sh')
++        (self.root / 'AGENTS.md').write_text(agents)
++        (self.root / 'docs').mkdir(exist_ok=True)
++        for name in ('LOG.md', 'AMELIORATIONS.md', 'QUESTIONS.md'):
++            (self.root / 'docs' / name).write_text('# Doc\n')
++
++    def test_docs_check_kit_marker_passes_with_required_documents(self):
++        self.kit_docs()
++        result = self.run_script('docs-check.sh')
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++        self.assertEqual(result.stdout, 'docs: OK\n')
++
++    def test_docs_check_kit_missing_log_fails(self):
++        self.kit_docs()
++        (self.root / 'docs/LOG.md').unlink()
++        result = self.run_script('docs-check.sh')
++        self.assertEqual(result.returncode, 1)
++        self.assertIn('DOCS FAIL: docs/LOG.md missing', result.stdout)
++
++    def test_docs_check_kit_long_rules_file_fails(self):
++        self.kit_docs('docs-check: kit\n' + 'regle\n' * 80)
++        result = self.run_script('docs-check.sh')
++        self.assertEqual(result.returncode, 1)
++        self.assertIn('DOCS FAIL: AGENTS.md longer than 80 lines', result.stdout)
++
++    def test_python_profile_uses_repo_test_runner_when_present(self):
++        (self.root / 'tests').mkdir()
++        (self.root / 'tests/run.sh').write_text('echo "$1" >> "$CALLS"\n')
++        for quick, calls in ((True, ['fast']), (False, ['ruff check .', 'full', 'docs'])):
++            with self.subTest(quick=quick):
++                self.log.unlink(missing_ok=True)
++                result = self.run_script('gate.sh', *(['--quick'] if quick else []))
++                self.assertEqual(result.returncode, 0, result.stderr)
++                self.assertEqual(self.log.read_text().splitlines(), calls)
++                rows = [json.loads(line) for line in result.stdout.splitlines()]
++                self.assertIn({'unittest': True}, rows)
++                self.assertNotIn({'pytest': True}, rows)

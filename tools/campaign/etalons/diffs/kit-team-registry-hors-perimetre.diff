@@ -1,0 +1,465 @@
+diff --git a/team.json b/team.json
+new file mode 100644
+--- /dev/null
++++ b/team.json
+@@ -0,0 +1,61 @@
++{
++  "note": "Les noms, pingouins et pièces de cette équipe sont provisoires, à choisir par le propriétaire.",
++  "membres": [
++    {
++      "nom": "Bric",
++      "pingouin": "bric",
++      "piece": "atelier",
++      "executant": "claude-sonnet",
++      "role": "écrit le code d'après une fiche",
++      "type": "code"
++    },
++    {
++      "nom": "Crash",
++      "pingouin": "crash",
++      "piece": "labo",
++      "executant": "claude-haiku",
++      "role": "écrit les tests et cherche à casser le code (casseur)",
++      "type": "test"
++    },
++    {
++      "nom": "Garde",
++      "pingouin": "garde",
++      "piece": "poste de garde",
++      "executant": "claude-sonnet",
++      "role": "relit la sécurité",
++      "type": "security"
++    },
++    {
++      "nom": "Fiole",
++      "pingouin": "fiole",
++      "piece": "labo",
++      "executant": "antigravity",
++      "role": "mène les essais scientifiques et les mesures",
++      "type": "exploration"
++    },
++    {
++      "nom": "Plume",
++      "pingouin": "plume",
++      "piece": "bibliothèque",
++      "executant": "claude-haiku",
++      "role": "écrit la documentation",
++      "type": "docs"
++    },
++    {
++      "nom": "Loupe",
++      "pingouin": "loupe",
++      "piece": "salle de relecture",
++      "executant": "codex",
++      "role": "relit les diffs importants",
++      "type": "exploration"
++    },
++    {
++      "nom": "Atlas",
++      "pingouin": "atlas",
++      "piece": "salle des cartes",
++      "executant": "antigravity",
++      "role": "explore le code et les sources",
++      "type": "exploration"
++    }
++  ]
++}
+
+[TRUNCATED]
+diff --git a/template/scripts/lib/delegate.py b/template/scripts/lib/delegate.py
+--- a/template/scripts/lib/delegate.py
++++ b/template/scripts/lib/delegate.py
+@@ -183,8 +183,8 @@
+     os.environ.setdefault('ASK_TIMEOUT', '1800')
+     global current_run, values, attempt_started, interaction_baseline
+     values = known_values(root)
+-    task = read_task(task_path)
+-    delay = float(os.environ.get('DELEGATE_RETRY_DELAY', '20'))
++    task = read_task(task_path, root)
++    delay =float(os.environ.get('DELEGATE_RETRY_DELAY', '20'))
+     if delay < 0:
+         raise ValueError('DELEGATE_RETRY_DELAY doit être positif ou nul')
+     agent_timeout = float(os.environ.get('DELEGATE_AGENT_TIMEOUT') or 0)
+@@ -238,7 +238,8 @@
+         if task.get('isolation') == 'full':
+             isolation = 'full'
+             isolation_reason = str(exc)
+-            status = dict(id=task['id'], agent=task['agent'], attempts=0, outcome='isolation_unavailable',
++            status = dict(id=task['id'], agent=task['agent'], agent_name=task['agent_name'], attempts=0,
++                          outcome='isolation_unavailable',
+                           files_changed=[], verify=None, started_at=now(), ended_at=now(), warnings=[],
+                           isolation=isolation, isolation_reason=isolation_reason, metrics=metrics)
+             record_outcome(status)
+@@ -248,12 +249,12 @@
+             return 1
+         raise
+ 
+-    status = dict(id=task['id'], agent=task['agent'], attempts=0, outcome='running',
++    status = dict(id=task['id'], agent=task['agent'], agent_name=task['agent_name'], attempts=0, outcome='running',
+                   acceptance_attempts=0, files_changed=[], verify=None, started_at=now(), ended_at=None, warnings=[],
+                   isolation=isolation, isolation_reason=isolation_reason, metrics=metrics)
+     (run / 'status.json').write_text(json.dumps(status))
+     events.record(root, task['id'], 'delegate_started',
+-                  {'agent': task['agent'], 'isolation': isolation,
++                  {'agent': task['agent'], 'agent_name': task['agent_name'], 'isolation': isolation,
+                    'container': sandbox.get_container_name(root, task['id']) if isolation == 'exchange' else None,
+                    'verify': task.get('verify') or None})
+     task_phase.set_phase(root, task['id'], 'delegated')
+diff --git a/template/scripts/lib/mission.py b/template/scripts/lib/mission.py
+--- a/template/scripts/lib/mission.py
++++ b/template/scripts/lib/mission.py
+@@ -67,7 +67,7 @@
+ def cmd_prepare(root: Path, task_file_arg: str, base_ref: Optional[str], caller_cwd: Path, retry: bool = False) -> int:
+     task_path = resolve_task_file(root, task_file_arg, caller_cwd)
+ 
+-    task_data = read_task(task_path)
++    task_data = read_task(task_path, root)
+     task_id = task_data['id']
+     agent = task_data['agent']
+     allowed = task_data['allowed']
+@@ -152,6 +152,7 @@
+                 "schema_version": 1,
+                 "task_id": task_id,
+                 "agent": agent,
++                "agent_name": task_data['agent_name'],
+                 "type": task_data['type'],
+                 "allowed": allowed,
+                 "base_commit": base_commit,
+diff --git a/template/scripts/lib/task.py b/template/scripts/lib/task.py
+--- a/template/scripts/lib/task.py
++++ b/template/scripts/lib/task.py
+@@ -71,6 +71,7 @@
+     return value
+ 
+ 
++EXECUTORS = ('codex', 'antigravity', 'claude-haiku', 'claude-sonnet', 'claude-opus')
+ TASK_TYPES = ('code', 'docs', 'test', 'security', 'exploration')
+ FULL_GATE_MESSAGE = ('verify ne doit pas lancer la porte complète (scripts/gate.sh) : elle tourne à la fusion ; '
+                      'indiquer une commande ciblée, par exemple les tests des fichiers touchés, '
+@@ -87,7 +88,16 @@
+     return False
+ 
+ 
+-def read_task(path):
++def resolve_agent(name, start):
++    """Map a member name of team.json to its executor; team is imported only when needed."""
++    lib = str(Path(__file__).parent)
++    if lib not in sys.path:
++        sys.path.append(lib)
++    import team
++    return team.resolve(name, start)
++
++
++def read_task(path, root=None):
+     lines = Path(path).read_text(encoding='utf-8').splitlines(keepends=True)
+     if not lines or lines[0].strip() != '---':
+         raise ValueError('En-tête de tâche attendu (---)')
+@@ -127,8 +137,10 @@
+             raise ValueError('Champ obligatoire manquant: ' + key)
+     if not isinstance(data['id'], str) or not re.fullmatch(r'[a-z0-9-]+', data['id']):
+         raise ValueError('id doit respecter [a-z0-9-]+')
+-    if data['agent'] not in ('codex', 'antigravity', 'claude-haiku', 'claude-sonnet', 'claude-opus'):
+-        raise ValueError('agent invalide')
++    data['agent_name'] = None
++    if data['agent'] not in EXECUTORS:
++        data['agent_name'] = data['agent']
++        data['agent'] = resolve_agent(data['agent'], root if root is not None else Path(path).parent)
+     data.setdefault('mode', 'write')
+     if data['mode'] not in ('write', 'review'):
+         raise ValueError('mode doit être write ou review')
+diff --git a/template/scripts/lib/team.py b/template/scripts/lib/team.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/team.py
+@@ -0,0 +1,52 @@
++"""Read the team registry team.json: named members mapped to executors.
++
++Public API: find_registry(start) -> Path | None, load(path) -> list of members,
++resolve(name, start) -> executor name (case-sensitive member lookup).
++"""
++import json
++from pathlib import Path
++
++
++EXECUTORS = ('codex', 'antigravity', 'claude-haiku', 'claude-sonnet', 'claude-opus')
++REGISTRY_NAME = 'team.json'
++
++
++def find_registry(start):
++    """First regular team.json in start or its parents; symbolic links are refused."""
++    directory = Path(start).absolute()
++    for folder in (directory, *directory.parents):
++        candidate = folder / REGISTRY_NAME
++        if candidate.is_file() and not candidate.is_symlink():
++            return candidate
++    return None
++
++
++def load(path):
++    try:
++        data = json.loads(Path(path).read_text(encoding='utf-8'))
++    except (OSError, ValueError) as exc:
++        raise ValueError('team.json invalide : ' + str(exc)) from exc
++    if not isinstance(data, dict) or not isinstance(data.get('membres'), list):
++        raise ValueError('team.json invalide : objet avec une liste membres attendu')
++    names = set()
++    for member in data['membres']:
++        if not isinstance(member, dict):
++            raise ValueError('team.json invalide : membre non objet')
++        name = member.get('nom')
++        if not isinstance(name, str) or not name:
++            raise ValueError('team.json invalide : nom de membre non vide attendu')
++        if name in names:
++            raise ValueError('team.json invalide : nom en double : ' + name)
++        names.add(name)
++        if member.get('executant') not in EXECUTORS:
++            raise ValueError('team.json invalide : executant inconnu pour ' + name)
++    return data['membres']
++
++
++def resolve(name, start):
++    registry = find_registry(start)
++    members = load(registry) if registry else []
++    for member in members:
++        if member['nom'] == name:
++            return member['executant']
++    raise ValueError(f'agent inconnu : {name} (ni exécutant, ni membre de team.json)')
+diff --git a/template/team.json b/template/team.json
+new file mode 100644
+--- /dev/null
++++ b/template/team.json
+@@ -0,0 +1,61 @@
++{
++  "note": "Les noms, pingouins et pièces de cette équipe sont provisoires, à choisir par le propriétaire.",
++  "membres": [
++    {
++      "nom": "Bric",
++      "pingouin": "bric",
++      "piece": "atelier",
++      "executant": "claude-sonnet",
++      "role": "écrit le code d'après une fiche",
++      "type": "code"
++    },
++    {
++      "nom": "Crash",
++      "pingouin": "crash",
++      "piece": "labo",
++      "executant": "claude-haiku",
++      "role": "écrit les tests et cherche à casser le code (casseur)",
++      "type": "test"
++    },
++    {
++      "nom": "Garde",
++      "pingouin": "garde",
++      "piece": "poste de garde",
++      "executant": "claude-sonnet",
++      "role": "relit la sécurité",
++      "type": "security"
++    },
++    {
++      "nom": "Fiole",
++      "pingouin": "fiole",
++      "piece": "labo",
++      "executant": "antigravity",
++      "role": "mène les essais scientifiques et les mesures",
++      "type": "exploration"
++    },
++    {
++      "nom": "Plume",
++      "pingouin": "plume",
++      "piece": "bibliothèque",
++      "executant": "claude-haiku",
++      "role": "écrit la documentation",
++      "type": "docs"
++    },
++    {
++      "nom": "Loupe",
++      "pingouin": "loupe",
++      "piece": "salle de relecture",
++      "executant": "codex",
++      "role": "relit les diffs importants",
++      "type": "exploration"
++    },
++    {
++      "nom": "Atlas",
++      "pingouin": "atlas",
++      "piece": "salle des cartes",
++      "executant": "antigravity",
++      "role": "explore le code et les sources",
++      "type": "exploration"
++    }
++  ]
++}
+diff --git a/tests/test_task.py b/tests/test_task.py
+--- a/tests/test_task.py
++++ b/tests/test_task.py
+@@ -121,3 +121,41 @@
+         base = 'id: demo\nagent: codex\nallowed: []'
+         with self.assertRaisesRegex(ValueError, 'répété'):
+             self.read(base + '\ntype: code\ntype: docs')
++
++    def test_direct_executor_has_no_agent_name(self):
++        task = self.read('id: demo\nagent: claude-haiku\nallowed: []')
++        self.assertEqual(task['agent'], 'claude-haiku')
++        self.assertIsNone(task['agent_name'])
++
++    def test_member_name_resolves_to_executor(self):
++        task = self.read('id: demo\nagent: Crash\nallowed: []')
++        self.assertEqual(task['agent'], 'claude-haiku')
++        self.assertEqual(task['agent_name'], 'Crash')
++        self.assertEqual(task['type'], 'code')
++
++    def test_member_name_is_case_sensitive(self):
++        with self.assertRaisesRegex(ValueError, 'crash'):
++            self.read('id: demo\nagent: crash\nallowed: []')
++
++    def test_unknown_agent_name_is_rejected(self):
++        with self.assertRaisesRegex(ValueError, 'agent inconnu : Inconnu'):
++            self.read('id: demo\nagent: Inconnu\nallowed: []')
++
++    def test_member_name_resolves_from_given_root(self):
++        with tempfile.TemporaryDirectory(dir=TEST_TMP) as folder:
++            root = Path(folder)
++            (root / 'team.json').write_text(json.dumps({'membres': [
++                {'nom': 'Atlas', 'executant': 'antigravity'}]}), encoding='utf-8')
++            fiche = root / 'elsewhere' / 'task.md'
++            fiche.parent.mkdir()
++            fiche.write_text('---\nid: demo\nagent: Atlas\nallowed: []\n---\nFaire la tâche.\n', encoding='utf-8')
++            task = self.load_module().read_task(fiche, root)
++        self.assertEqual(task['agent'], 'antigravity')
++        self.assertEqual(task['agent_name'], 'Atlas')
++        self.assertEqual(task['type'], 'docs')
++
++    def load_module(self):
++        spec = importlib.util.spec_from_file_location('task', ROOT / 'template/scripts/lib/task.py')
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return module
+diff --git a/tests/test_team.py b/tests/test_team.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_team.py
+@@ -0,0 +1,117 @@
++import importlib.util
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from unittest import mock
++
++ROOT = Path(__file__).resolve().parents[1]
++# Keep fixtures in the repository: system temporary directories may be sandboxed.
++TEST_TMP = ROOT / '.workspace/tmp-tests'
++TEST_TMP.mkdir(parents=True, exist_ok=True)
++MEMBER_NAMES = ['Bric', 'Crash', 'Garde', 'Fiole', 'Plume', 'Loupe', 'Atlas']
++
++
++def load_team():
++    spec = importlib.util.spec_from_file_location('team', ROOT / 'template/scripts/lib/team.py')
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def member(name, executant='codex'):
++    return {'nom': name, 'pingouin': name.lower(), 'piece': 'atelier', 'executant': executant,
++            'role': 'essai', 'type': 'code'}
++
++
++class TeamRegistryTests(unittest.TestCase):
++    def setUp(self):
++        self.team = load_team()
++
++    def test_kit_registry_is_valid_and_matches_template(self):
++        kit = (ROOT / 'team.json').read_text(encoding='utf-8')
++        template = (ROOT / 'template/team.json').read_text(encoding='utf-8')
++        self.assertEqual(kit, template)
++        self.assertEqual(json.loads(kit), json.loads(template))
++        self.assertEqual(kit, json.dumps(json.loads(kit), ensure_ascii=False, indent=2) + '\n')
++        members = self.team.load(ROOT / 'template/team.json')
++        self.assertEqual([m['nom'] for m in members], MEMBER_NAMES)
++        self.assertEqual(members[0]['executant'], 'claude-sonnet')
++        self.assertEqual(members[3]['executant'], 'antigravity')
++        self.assertIn('provisoires', json.loads(template)['note'])
++
++    def test_resolve_kit_members_to_executors(self):
++        self.assertEqual(self.team.resolve('Crash', ROOT), 'claude-haiku')
++        self.assertEqual(self.team.resolve('Loupe', ROOT), 'codex')
++        self.assertEqual(self.team.resolve('Atlas', ROOT), 'antigravity')
++
++    def test_resolve_is_case_sensitive_and_rejects_unknown_names(self):
++        for name in ('crash', 'Inconnu', 'codex'):
++            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'agent inconnu : ' + name):
++                self.team.resolve(name, ROOT)
++
++    def test_resolve_without_registry_raises(self):
++        # TEST_TMP sits under the repository, whose team.json would be found: stub the search.
++        with mock.patch.object(self.team, 'find_registry', return_value=None):
++            with self.assertRaisesRegex(ValueError, 'agent inconnu : Crash'):
++                self.team.resolve('Crash', TEST_TMP)
++
++    def test_find_registry_walks_up_to_parents(self):
++        with tempfile.TemporaryDirectory(dir=TEST_TMP) as folder:
++            root = Path(folder)
++            (root / 'team.json').write_text(json.dumps({'membres': [member('Ada', 'codex')]}), encoding='utf-8')
++            run = root / '.workspace' / 'run' / 'delegate' / 'demo'
++            run.mkdir(parents=True)
++            self.assertEqual(self.team.find_registry(run), root / 'team.json')
++            self.assertEqual(self.team.resolve('Ada', run), 'codex')
++
++    def test_find_registry_prefers_nearest_file(self):
++        with tempfile.TemporaryDirectory(dir=TEST_TMP) as folder:
++            root = Path(folder)
++            (root / 'team.json').write_text(json.dumps({'membres': [member('Ada', 'codex')]}), encoding='utf-8')
++            inner = root / 'inner'
++            inner.mkdir()
++            (inner / 'team.json').write_text(json.dumps({'membres': [member('Ada', 'claude-opus')]}), encoding='utf-8')
++            self.assertEqual(self.team.resolve('Ada', inner), 'claude-opus')
++
++    def test_find_registry_refuses_symbolic_link(self):
++        with tempfile.TemporaryDirectory(dir=TEST_TMP) as folder:
++            root = Path(folder)
++            target = root / 'real.json'
++            target.write_text(json.dumps({'membres': [member('Ada')]}), encoding='utf-8')
++            child = root / 'child'
++            child.mkdir()
++            (child / 'team.json').symlink_to(target)
++            # The link is skipped: the search goes on to the parents, never returns the link itself.
++            self.assertNotEqual(self.team.find_registry(child), child / 'team.json')
++
++    def test_invalid_registries_are_rejected(self):
++        invalid = [
++            [],
++            {'membres': 'Ada'},
++            {'membres': ['Ada']},
++            {'membres': [{'nom': '', 'executant': 'codex'}]},
++            {'membres': [{'executant': 'codex'}]},
++            {'membres': [member('Ada', 'gemini')]},
++            {'membres': [member('Ada'), member('Ada')]},
++        ]
++        with tempfile.TemporaryDirectory(dir=TEST_TMP) as folder:
++            path = Path(folder) / 'team.json'
++            for data in invalid:
++                with self.subTest(data=data):
++                    path.write_text(json.dumps(data), encoding='utf-8')
++                    with self.assertRaisesRegex(ValueError, 'team.json invalide'):
++                        self.team.load(path)
++            path.write_text('{pas du json', encoding='utf-8')
++            with self.assertRaisesRegex(ValueError, 'team.json invalide'):
++                self.team.load(path)
++
++    def test_load_returns_members_in_order(self):
++        with tempfile.TemporaryDirectory(dir=TEST_TMP) as folder:
++            path = Path(folder) / 'team.json'
++            path.write_text(json.dumps({'membres': [member('Ada'), member('Bob', 'codex')]}), encoding='utf-8')
++            self.assertEqual([m['nom'] for m in self.team.load(path)], ['Ada', 'Bob'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

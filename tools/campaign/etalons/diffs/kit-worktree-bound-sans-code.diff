@@ -1,0 +1,22 @@
+diff --git a/tests/test_ask.py b/tests/test_ask.py
+--- a/tests/test_ask.py
++++ b/tests/test_ask.py
+@@ -225,5 +225,18 @@
+         q_file = self.root / f'.workspace/orchestration/tasks/{task_id}/context/questions/001.md'
+         self.assertTrue(q_file.is_file())
+ 
++    def test_project_under_a_delegated_worktree_keeps_its_own_registry(self):
++        # A test project is not a worktree because one of its ancestors is: the
++        # search for .workspace/exchange must stop at the project root.
++        enclosing_exchange = Path(self.temp.name) / '.workspace/exchange'
++        enclosing_exchange.mkdir(parents=True)
++        task_id = self.prepare_task('task-enclosed')
++        res = self.run_ask(task_id, 'Question du projet englobé ?', env={'ASK_TIMEOUT': '0'})
++        self.assertNotIn('Tâche inconnue', res.stderr)
++        q_file = self.root / f'.workspace/orchestration/tasks/{task_id}/context/questions/001.md'
++        self.assertTrue(q_file.is_file())
++        self.assertIn('projet englobé', q_file.read_text())
++        self.assertEqual(list(enclosing_exchange.rglob('*.md')), [])
++
+ if __name__ == '__main__':
+     unittest.main()

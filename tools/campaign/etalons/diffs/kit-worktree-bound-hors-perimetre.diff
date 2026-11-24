@@ -1,0 +1,70 @@
+diff --git a/template/scripts/lib/context.py b/template/scripts/lib/context.py
+--- a/template/scripts/lib/context.py
++++ b/template/scripts/lib/context.py
+@@ -56,22 +56,25 @@
+ 
+ 
+ def is_in_worktree(root: Path) -> Tuple[bool, Optional[Path]]:
+-    """Détecte si l'appel est fait depuis ou dans un worktree de tâche."""
++    """Détecte si l'appel est fait depuis ou dans un worktree de tâche du projet `root`."""
+     if (root / '.workspace/exchange').is_dir():
+         return True, root
++    root = root.resolve()
+     cwd = Path.cwd().resolve()
+-    if (cwd / '.workspace/exchange').is_dir():
+-        return True, cwd
+-    for parent in cwd.parents:
+-        if (parent / '.workspace/exchange').is_dir():
+-            return True, parent
+-    parts = cwd.parts
+-    if 'worktrees' in parts:
+-        idx = parts.index('worktrees')
+-        if idx > 0 and parts[idx - 1] == '.workspace' and idx + 1 < len(parts):
+-            wt_path = Path(*parts[:idx + 2])
+-            if (wt_path / '.workspace/exchange').is_dir():
+-                return True, wt_path
++    try:
++        rel = cwd.relative_to(root)
++    except ValueError:
++        return False, None
++    for candidate in (cwd, *cwd.parents):
++        if candidate == root:
++            break
++        if (candidate / '.workspace/exchange').is_dir():
++            return True, candidate
++    parts = rel.parts
++    if len(parts) >= 3 and parts[:2] == ('.workspace', 'worktrees'):
++        wt_path = root.joinpath(*parts[:3])
++        if (wt_path / '.workspace/exchange').is_dir():
++            return True, wt_path
+     return False, None
+ 
+ 
+diff --git a/tests/test_ask.py b/tests/test_ask.py
+--- a/tests/test_ask.py
++++ b/tests/test_ask.py
+@@ -225,5 +225,18 @@
+         q_file = self.root / f'.workspace/orchestration/tasks/{task_id}/context/questions/001.md'
+         self.assertTrue(q_file.is_file())
+ 
++    def test_project_under_a_delegated_worktree_keeps_its_own_registry(self):
++        # A test project is not a worktree because one of its ancestors is: the
++        # search for .workspace/exchange must stop at the project root.
++        enclosing_exchange = Path(self.temp.name) / '.workspace/exchange'
++        enclosing_exchange.mkdir(parents=True)
++        task_id = self.prepare_task('task-enclosed')
++        res = self.run_ask(task_id, 'Question du projet englobé ?', env={'ASK_TIMEOUT': '0'})
++        self.assertNotIn('Tâche inconnue', res.stderr)
++        q_file = self.root / f'.workspace/orchestration/tasks/{task_id}/context/questions/001.md'
++        self.assertTrue(q_file.is_file())
++        self.assertIn('projet englobé', q_file.read_text())
++        self.assertEqual(list(enclosing_exchange.rglob('*.md')), [])
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

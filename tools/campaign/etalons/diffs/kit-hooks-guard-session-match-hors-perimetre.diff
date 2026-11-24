@@ -1,0 +1,128 @@
+diff --git a/template/scripts/lib/hooks_guard.py b/template/scripts/lib/hooks_guard.py
+--- a/template/scripts/lib/hooks_guard.py
++++ b/template/scripts/lib/hooks_guard.py
+@@ -28,7 +28,6 @@
+ SEPARATORS = (';', '&&', '||', '|', '|&', '&')
+ ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
+ IN_PLACE_FLAG = re.compile(r'-[A-Za-z]*i|--in-place')
+-MAX_HOPS = 32
+ EXIT_USAGE = 64
+ TASK_ENV = 'WORKSPACE_TASK_ID'
+ REFUSAL = ('Refusé : %s est un chemin protégé du circuit (scripts/, project.profile, .workspace/) ; '
+@@ -132,28 +131,15 @@
+     return None
+ 
+ 
+-def _is_ancestor(pid):
+-    """Vrai si `pid` est un ancêtre du crochet, à 32 niveaux au plus."""
+-    current = os.getppid()
+-    for _ in range(MAX_HOPS):
+-        if current == pid:
+-            return True
+-        info = orchestrator._process_info(current)
+-        if info is None or info[0] <= 1:
+-            return False
+-        current = info[0]
+-    return False
+-
+-
+ def _own_lock(root):
+-    """Verrou tenu par un processus vivant qui est un ancêtre du crochet ; `None` sinon."""
++    """Verrou tenu par un processus vivant qui est la session du crochet (règle de `claim`) ; `None` sinon."""
+     try:
+         held = orchestrator._read_lock(orchestrator._lock_path(root))
+     except ValueError:
+         return None
+     pid = held.get('pid') if held else None
+     alive = isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and orchestrator._pid_alive(pid)
+-    return held if alive and _is_ancestor(pid) else None
++    return held if alive and pid == orchestrator._session_pid(os.getppid()) else None
+ 
+ 
+ def _read_payload():
+diff --git a/tests/test_hooks_guard.py b/tests/test_hooks_guard.py
+--- a/tests/test_hooks_guard.py
++++ b/tests/test_hooks_guard.py
+@@ -12,16 +12,19 @@
+ BLOCKED = 2
+ ALLOWED = 0
+ STRIPPED_ENV = ('WORKSPACE_TASK_ID', 'CLAUDE_PROJECT_DIR')
+-
+-
+-def run_hook(mode, project, payload=None, raw=None, extra_env=None):
++# Processus placés entre le test et le crochet ; `exit $?` empêche le shell de se remplacer par la commande.
++VIA_SHELL = ['sh', '-c', '"$@"; exit $?', 'sh']
++VIA_PYTHON = [sys.executable, '-c', 'import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))']
++
++
++def run_hook(mode, project, payload=None, raw=None, extra_env=None, via=()):
+     """Lance le crochet en sous-processus ; renvoie (code de sortie, sortie d'erreur)."""
+     env = {key: value for key, value in os.environ.items() if key not in STRIPPED_ENV}
+     if project is not None:
+         env['CLAUDE_PROJECT_DIR'] = str(project)
+     env.update(extra_env or {})
+     data = raw if raw is not None else json.dumps(payload)
+-    done = subprocess.run([sys.executable, str(SCRIPT), mode], input=data, env=env,
++    done = subprocess.run(list(via) + [sys.executable, str(SCRIPT), mode], input=data, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           encoding='utf-8')
+     return done.returncode, done.stdout, done.stderr
+@@ -42,15 +45,15 @@
+         self.root = Path(tmp.name) / 'project'
+         self.root.mkdir()
+ 
+-    def pre_tool(self, tool, tool_input, extra_env=None):
++    def pre_tool(self, tool, tool_input, extra_env=None, via=()):
+         payload = {'tool_name': tool, 'tool_input': tool_input, 'cwd': str(self.root)}
+-        return run_hook('pre-tool', self.root, payload, extra_env=extra_env)
++        return run_hook('pre-tool', self.root, payload, extra_env=extra_env, via=via)
+ 
+     def bash(self, command, extra_env=None):
+         return self.pre_tool('Bash', {'command': command}, extra_env)
+ 
+-    def stop(self, payload=None, extra_env=None):
+-        return run_hook('stop', self.root, payload or {'stop_hook_active': False}, extra_env=extra_env)
++    def stop(self, payload=None, extra_env=None, via=()):
++        return run_hook('stop', self.root, payload or {'stop_hook_active': False}, extra_env=extra_env, via=via)
+ 
+     def hold_lock(self, pid, session='session-test'):
+         lock = self.root / '.workspace/orchestrator.json'
+@@ -200,6 +203,17 @@
+                 lock.write_text(content)
+                 self.assertEqual(self.pre_tool('Write', {'file_path': 'scripts/x.sh'})[0], BLOCKED)
+ 
++    def test_hook_launched_through_a_shell_keeps_the_exception(self):
++        self.hold_lock(os.getpid())
++        code, _, err = self.pre_tool('Write', {'file_path': '.workspace/tasks/a.md'}, via=VIA_SHELL)
++        self.assertEqual((code, err), (ALLOWED, ''))
++
++    def test_hook_launched_by_a_non_shell_child_of_the_holder_gets_no_exception(self):
++        self.hold_lock(os.getpid())
++        code, _, err = self.pre_tool('Write', {'file_path': 'scripts/x.sh'}, via=VIA_PYTHON)
++        self.assertEqual(code, BLOCKED)
++        self.assertIn('scripts/x.sh', err)
++
+     def test_absent_lock_refuses(self):
+         self.assertEqual(self.pre_tool('Write', {'file_path': 'scripts/x.sh'})[0], BLOCKED)
+ 
+@@ -225,6 +239,14 @@
+     def test_dead_lock_holder_does_not_block_stop(self):
+         self.hold_lock(dead_pid())
+         self.assertEqual(self.stop()[0], ALLOWED)
++
++    def test_stop_through_a_shell_still_reminds_the_holder(self):
++        self.hold_lock(os.getpid())
++        self.assertEqual(self.stop(via=VIA_SHELL)[0], BLOCKED)
++
++    def test_stop_launched_by_a_non_shell_child_of_the_holder_is_silent(self):
++        self.hold_lock(os.getpid())
++        self.assertEqual(self.stop(via=VIA_PYTHON), (ALLOWED, '', ''))
+ 
+     def test_lock_of_a_live_non_ancestor_does_not_block_stop(self):
+         self.hold_lock(self.live_non_ancestor())
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

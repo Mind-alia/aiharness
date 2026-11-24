@@ -1,0 +1,548 @@
+
+[TRUNCATED]
+diff --git a/template/scripts/lib/delegate.py b/template/scripts/lib/delegate.py
+--- a/template/scripts/lib/delegate.py
++++ b/template/scripts/lib/delegate.py
+@@ -55,6 +55,10 @@
+ metrics = dict(duration_seconds=0, attempt_durations_seconds=[], attempts=0,
+                execution_requests=0, questions=0, tokens=None)
+ interaction_baseline = set()
++# Study switches: force a fake verification failure on the first attempt, or turn session resuming off.
++STUDY_FORCED_MESSAGE = 'Échec forcé (étude de reprise) : relance ta vérification ciblée et confirme ton travail.'
++study_force_fail = os.environ.get('WORKSPACE_STUDY_FORCE_FAIL') == '1'
++study_resume = os.environ.get('WORKSPACE_DELEGATE_RESUME') != '0'
+ 
+ 
+ def interactions():
+@@ -254,6 +258,8 @@
+     status = dict(id=task['id'], agent=task['agent'], agent_name=task['agent_name'], attempts=0, outcome='running',
+                   acceptance_attempts=0, files_changed=[], verify=None, started_at=now(), ended_at=None, warnings=[],
+                   isolation=isolation, isolation_reason=isolation_reason, metrics=metrics)
++    if study_force_fail or not study_resume:
++        status['study'] = dict(resume=study_resume, forced_first_failure=False)
+     (run / 'status.json').write_text(json.dumps(status))
+     events.record(root, task['id'], 'delegate_started',
+                   {'agent': task['agent'], 'agent_name': task['agent_name'], 'isolation': isolation,
+@@ -419,7 +425,7 @@
+             metrics['attempts'] = attempt
+             status['attempts'] = attempt
+             # Resume the previous Claude session with only what changed since, not the whole prompt again.
+-            resume = session_id if task['agent'].startswith('claude-') and attempt > 1 else None
++            resume = session_id if task['agent'].startswith('claude-') and attempt > 1 and study_resume else None
+             message = (followup or INTERRUPTED_MESSAGE) if resume else prompt
+             followup = session_id = None
+             max_turns_reached = False
+@@ -501,6 +507,10 @@
+             if verify.is_file():
+                 task_phase.set_phase(root, task['id'], 'verifying')
+                 exit_code, out, err = execute(['bash', str(verify), str(contract)], cwd=work_dir)
++                if study_force_fail and attempt == 1 and task['attempts'] >= 2:
++                    out = STUDY_FORCED_MESSAGE + '\n' + out
++                    exit_code = exit_code or 1
++                    status['study']['forced_first_failure'] = True
+                 (run / 'verify.txt').write_text(mask_secrets(bounded(out + err), values), encoding='utf-8')
+                 if not intact():
+                     status['outcome'] = 'control_tampered'
+diff --git a/tests/test_delegate_study.py b/tests/test_delegate_study.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_delegate_study.py
+@@ -0,0 +1,120 @@
++import json
++import shutil
++import unittest
++
++from tests import test_delegate_cost as cost
++
++FORCED = 'Échec forcé (étude de reprise) : relance ta vérification ciblée et confirme ton travail.'
++PLAN = [{'stdout': json.dumps({'result': 'first', 'session_id': 'sess-1'})},
++        {'stdout': json.dumps({'result': 'second', 'session_id': 'sess-2'})}]
++
++
++class DelegateStudyTests(unittest.TestCase):
++    # Same fixture as the cost tests: a temporary project and a fake `claude` that records its calls.
++    setUp = cost.DelegateCostTests.setUp
++    git = cost.DelegateCostTests.git
++    executable = cost.DelegateCostTests.executable
++    write_task = cost.DelegateCostTests.write_task
++    run_delegate = cost.DelegateCostTests.run_delegate
++    status = cost.DelegateCostTests.status
++    args = cost.DelegateCostTests.args
++    stdin = cost.DelegateCostTests.stdin
++    calls = cost.DelegateCostTests.calls
++    failing_first_verification = cost.DelegateCostTests.failing_first_verification
++
++    def study(self, **variables):
++        self.env.update(variables)
++
++    def verify_text(self):
++        return (self.root / '.workspace/run/delegate/demo/verify.txt').read_text()
++
++    def test_forced_failure_resumes_with_only_the_feedback(self):
++        self.write_task()
++        self.study(WORKSPACE_STUDY_FORCE_FAIL='1')
++        result = self.run_delegate(PLAN)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(self.calls(), 2)
++        self.assertNotIn('--resume', self.args(1))
++        self.assertEqual(self.args(2)[-2:], ['--resume', 'sess-1'])
++        self.assertTrue(self.stdin(2).startswith('Échec de vérification, corriger :\n' + FORCED + '\n'))
++        self.assertNotIn('TASK BODY', self.stdin(2))
++        status = self.status()
++        self.assertEqual(status['outcome'], 'done')
++        self.assertEqual(status['attempts'], 2)
++        self.assertEqual(status['study'], {'resume': True, 'forced_first_failure': True})
++        self.assertEqual(self.events('verify'), [{'exit': 1}, {'exit': 0}])
++
++    def test_forced_failure_output_is_the_banner_then_the_real_output(self):
++        self.write_task()
++        self.executable('scripts/verify-task.sh', '#!/bin/sh\necho REAL OUTPUT\n')
++        self.study(WORKSPACE_STUDY_FORCE_FAIL='1')
++        self.assertEqual(self.run_delegate(PLAN).returncode, 0)
++        self.assertIn('Échec de vérification, corriger :\n' + FORCED + '\nREAL OUTPUT', self.stdin(2))
++        # The second verification is not forced: only its own output is left.
++        self.assertEqual(self.verify_text(), 'REAL OUTPUT\n')
++
++    def test_forced_failure_without_resume_sends_the_whole_prompt(self):
++        self.write_task()
++        self.study(WORKSPACE_STUDY_FORCE_FAIL='1', WORKSPACE_DELEGATE_RESUME='0')
++        self.assertEqual(self.run_delegate(PLAN).returncode, 0)
++        self.assertEqual(self.calls(), 2)
++        self.assertNotIn('--resume', self.args(2))
++        self.assertIn('TASK BODY', self.stdin(2))
++        self.assertIn('Échec de vérification, corriger :\n' + FORCED, self.stdin(2))
++        self.assertEqual(self.status()['study'], {'resume': False, 'forced_first_failure': True})
++        self.assertEqual([e['resumed'] for e in self.events('attempt_started')], [False, False])
++
++    def test_resume_switch_alone_keeps_the_real_failure_and_drops_the_resume(self):
++        self.write_task()
++        self.failing_first_verification()
++        self.study(WORKSPACE_DELEGATE_RESUME='0')
++        self.assertEqual(self.run_delegate(PLAN).returncode, 0)
++        self.assertNotIn('--resume', self.args(2))
++        self.assertIn('TASK BODY', self.stdin(2))
++        self.assertIn('FIX THIS FAILURE', self.stdin(2))
++        self.assertNotIn(FORCED, self.stdin(2))
++        self.assertEqual(self.status()['study'], {'resume': False, 'forced_first_failure': False})
++
++    def test_any_other_resume_value_keeps_resuming(self):
++        for value in ('1', '', 'no'):
++            with self.subTest(value):
++                shutil.rmtree(self.record)
++                self.record.mkdir()
++                self.write_task()
++                self.failing_first_verification()
++                self.study(WORKSPACE_DELEGATE_RESUME=value)
++                self.assertEqual(self.run_delegate(PLAN).returncode, 0)
++                self.assertEqual(self.args(2)[-2:], ['--resume', 'sess-1'])
++                self.assertNotIn('study', self.status())
++
++    def test_single_attempt_is_never_forced(self):
++        self.write_task()
++        self.task.write_text(self.task.read_text().replace('attempts: 2', 'attempts: 1'))
++        self.study(WORKSPACE_STUDY_FORCE_FAIL='1')
++        self.assertEqual(self.run_delegate(PLAN).returncode, 0)
++        self.assertEqual(self.calls(), 1)
++        self.assertNotIn(FORCED, self.verify_text())
++        status = self.status()
++        self.assertEqual(status['outcome'], 'done')
++        self.assertEqual(status['study'], {'resume': True, 'forced_first_failure': False})
++
++    def test_force_switch_needs_the_exact_value_one(self):
++        self.write_task()
++        self.study(WORKSPACE_STUDY_FORCE_FAIL='0')
++        self.assertEqual(self.run_delegate(PLAN).returncode, 0)
++        self.assertEqual(self.calls(), 1)
++        self.assertNotIn('study', self.status())
++
++    def test_without_variables_behaviour_and_status_are_unchanged(self):
++        self.write_task()
++        self.failing_first_verification()
++        self.assertEqual(self.run_delegate(PLAN).returncode, 0)
++        self.assertEqual(self.args(2)[-2:], ['--resume', 'sess-1'])
++        self.assertNotIn(FORCED, self.stdin(2))
++        self.assertNotIn('study', self.status())
++
++    events = cost.DelegateCostTests.events
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_resume_study.py b/tests/test_resume_study.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_resume_study.py
+@@ -0,0 +1,163 @@
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++
++SCRIPT = Path(__file__).resolve().parents[1] / 'tools/campaign/resume_study.py'
++
++FICHE = ('---\nid: demo\nagent: codex\nmode: write\nallowed: [a.txt]\nattempts: 3\n---\n'
++         'id: ne pas toucher\nattempts: 9\nCORPS\n')
++
++# Fake circuit scripts: log every call with the study switches, write the status of the delegation.
++TASK_WORKSPACE = '''echo "task-workspace $*" >> "$LOG"
++if [ "$1" = prepare ] && [ -n "$FAIL_PREPARE" ] && [ "$2" = ".workspace/tasks/$FAIL_PREPARE.md" ]; then echo broken; exit 1; fi
++'''
++DELEGATE = '''id=$(basename "$1" .md)
++echo "delegate $* FORCE=${WORKSPACE_STUDY_FORCE_FAIL-unset} RESUME=${WORKSPACE_DELEGATE_RESUME-unset} ROOT=${WORKSPACE_AGENT_ROOT-unset} PWD=$(pwd)" >> "$LOG"
++mkdir -p ".workspace/run/delegate/$id"
++if [ "${WORKSPACE_DELEGATE_RESUME-}" = 0 ]; then read=0; second=40.5; else read=1000; second=20; fi
++printf '{"outcome":"done","attempts":2,"metrics":{"duration_seconds":100.25,"attempt_durations_seconds":[50,%s],"tokens":{"input":10,"cached_input":%s,"cache_creation":5,"output":7}}}' "$second" "$read" > ".workspace/run/delegate/$id/status.json"
++'''
++
++
++class ResumeStudyTests(unittest.TestCase):
++    def setUp(self):
++        temp = tempfile.TemporaryDirectory()
++        self.addCleanup(temp.cleanup)
++        base = Path(temp.name).resolve()
++        self.project, self.source, self.out = base / 'project', base / 'kit', base / 'out'
++        self.log = base / 'calls.log'
++        (self.project / 'scripts').mkdir(parents=True)
++        (self.project / '.gitignore').write_text('.workspace/\n')
++        (self.project / 'scripts/task-workspace.sh').write_text(TASK_WORKSPACE)
++        (self.project / 'scripts/delegate.sh').write_text(DELEGATE)
++        self.git('init', '-q', '-b', 'main')
++        self.git('add', '.')
++        self.git('-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'base')
++        for name, sha in (('t1', 'aaa111'), ('t2', 'bbb222')):
++            self.add_source(name, sha)
++
++    def git(self, *args):
++        subprocess.run(['git', '-C', str(self.project), *args], check=True, capture_output=True)
++
++    def add_source(self, name, sha):
++        (self.source / '.workspace/tasks').mkdir(parents=True, exist_ok=True)
++        (self.source / '.workspace/tasks' / (name + '.md')).write_text(FICHE.replace('demo', name))
++        (self.source / '.workspace/acceptance' / name / 'tests').mkdir(parents=True)
++        (self.source / '.workspace/acceptance' / name / 'tests/test_hidden.py').write_text('hidden ' + name)
++        state = self.source / '.workspace/orchestration/tasks' / name
++        state.mkdir(parents=True)
++        (state / 'state.json').write_text(json.dumps({'base_commit': sha}))
++
++    def run_study(self, tasks='t1,t2', extra=(), **env):
++        environment = dict(os.environ, LOG=str(self.log), WORKSPACE_AGENT_ROOT='/should/be/removed', **env)
++        return subprocess.run([sys.executable, str(SCRIPT), '--project', str(self.project), '--source', str(self.source),
++                               '--tasks', tasks, '--out', str(self.out), *extra],
++                              env=environment, text=True, capture_output=True)
++
++    def calls(self):
++        return self.log.read_text().splitlines() if self.log.exists() else []
++
++    def rows(self):
++        return [json.loads(line) for line in (self.out / 'results.jsonl').read_text().splitlines()]
++
++    def test_each_task_runs_once_per_mode_with_the_right_switches(self):
++        result = self.run_study()
++        self.assertEqual(result.returncode, 0, result.stderr)
++        calls = self.calls()
++        self.assertEqual(len(calls), 12)
++        self.assertEqual(calls[0], 'task-workspace prepare .workspace/tasks/t1-etude-reprise.md --base aaa111')
++        self.assertTrue(calls[1].startswith('delegate .workspace/tasks/t1-etude-reprise.md FORCE=1 RESUME=unset ROOT=unset PWD='))
++        self.assertTrue(calls[1].endswith(str(self.project)))
++        self.assertEqual(calls[2], 'task-workspace close t1-etude-reprise --abandoned --force')
++        self.assertEqual(calls[3], 'task-workspace prepare .workspace/tasks/t1-etude-sans-reprise.md --base aaa111')
++        self.assertIn('FORCE=1 RESUME=0 ROOT=unset', calls[4])
++        self.assertEqual(calls[6], 'task-workspace prepare .workspace/tasks/t2-etude-reprise.md --base bbb222')
++        self.assertEqual([r['study_id'] for r in self.rows()], [
++            't1-etude-reprise', 't1-etude-sans-reprise', 't2-etude-reprise', 't2-etude-sans-reprise'])
++        self.assertFalse(any('merge' in call for call in calls))
++
++    def test_study_fiche_rewrites_only_the_header_and_copies_the_hidden_tests(self):
++        self.assertEqual(self.run_study('t1', ('--agent', 'claude-sonnet')).returncode, 0)
++        fiche = (self.project / '.workspace/tasks/t1-etude-sans-reprise.md').read_text()
++        self.assertEqual(fiche, FICHE.replace('demo', 't1-etude-sans-reprise')
++                         .replace('agent: codex', 'agent: claude-sonnet').replace('attempts: 3', 'attempts: 2'))
++        self.assertIn('id: ne pas toucher\nattempts: 9\nCORPS', fiche)
++        copy = self.project / '.workspace/acceptance/t1-etude-reprise/tests/test_hidden.py'
++        self.assertEqual(copy.read_text(), 'hidden t1')
++
++    def test_results_and_table_carry_durations_tokens_and_totals_per_mode(self):
++        self.assertEqual(self.run_study('t1').returncode, 0)
++        first, second = self.rows()
++        self.assertEqual(first, {
++            'task': 't1', 'mode': 'reprise', 'study_id': 't1-etude-reprise', 'outcome': 'done', 'attempts': 2,
++            'duration_seconds': 100.25, 'second_attempt_seconds': 20,
++            'tokens': {'input': 10, 'cache_read': 1000, 'cache_write': 5, 'output': 7}})
++        self.assertEqual(second['second_attempt_seconds'], 40.5)
++        self.assertEqual(second['tokens']['cache_read'], 0)
++        lines = (self.out / 'resultats.md').read_text().splitlines()
++        self.assertEqual(lines[0], '| Tâche | Mode | Issue | Tentatives | Durée (s) | 2e tentative (s) | Cache lu | Cache écrit | Entrée | Sortie |')
++        self.assertTrue(lines[2].startswith('| t1 | reprise | done | 2 | 100.2 | 20 | 1000 | 5 | 10 | 7 |'))
++        self.assertTrue(lines[-2].startswith('| Total reprise |'))
++        self.assertIn('| 100.2 | 20 | 1000 | 5 | 10 | 7 |', lines[-2])
++        self.assertTrue(lines[-1].startswith('| Total sans-reprise |'))
++        self.assertIn('| 100.2 | 40.5 | 0 | 5 | 10 | 7 |', lines[-1])
++
++    def test_rerun_after_a_finished_pass_launches_nothing(self):
++        self.assertEqual(self.run_study('t1').returncode, 0)
++        before = self.calls()
++        self.assertEqual(self.run_study('t1').returncode, 0)
++        self.assertEqual(self.calls(), before)
++        self.assertEqual(len(self.rows()), 2)
++
++    def test_a_failed_prepare_is_an_error_row_without_delegation_and_is_retried(self):
++        self.assertEqual(self.run_study('t1', FAIL_PREPARE='t1-etude-reprise').returncode, 0)
++        first = self.rows()[0]
++        self.assertIn('prepare en échec', first['error'])
++        self.assertIsNone(first['outcome'])
++        self.assertFalse(any(call.startswith('delegate') and 'etude-reprise.md' in call for call in self.calls()))
++        self.assertEqual(self.run_study('t1').returncode, 0)
++        rows = self.rows()
++        self.assertEqual([('error' in r) for r in rows], [True, False, False])
++        self.assertEqual(rows[1]['mode'], 'sans-reprise')
++        self.assertEqual(rows[2]['mode'], 'reprise')
++
++    def test_project_stays_clean(self):
++        self.assertEqual(self.run_study().returncode, 0)
++        status = subprocess.run(['git', '-C', str(self.project), 'status', '--porcelain'], text=True, capture_output=True)
++        self.assertEqual(status.stdout, '')
++
++    def assert_refused(self, result):
++        self.assertEqual(result.returncode, 64, result.stderr)
++        self.assertEqual(self.calls(), [])
++        self.assertFalse(self.out.exists())
++        self.assertFalse((self.project / '.workspace').exists())
++
++    def test_dirty_project_is_refused_before_anything_runs(self):
++        (self.project / 'stray.txt').write_text('x')
++        self.assert_refused(self.run_study())
++
++    def test_unknown_task_is_refused_before_anything_runs(self):
++        self.assert_refused(self.run_study('t1,nope'))
++
++    def test_task_without_hidden_tests_or_base_commit_is_refused(self):
++        (self.source / '.workspace/orchestration/tasks/t2/state.json').write_text('{}')
++        self.assert_refused(self.run_study())
++        (self.source / '.workspace/orchestration/tasks/t2/state.json').write_text(json.dumps({'base_commit': 'bbb222'}))
++        shutil.rmtree(self.source / '.workspace/acceptance/t2')
++        self.assert_refused(self.run_study())
++
++    def test_invalid_usage_is_refused(self):
++        for tasks in ('', 't1,,t2', 't1,t1', '../t1'):
++            with self.subTest(tasks):
++                self.assert_refused(self.run_study(tasks))
++        result = subprocess.run([sys.executable, str(SCRIPT), '--project', str(self.project)], text=True, capture_output=True)
++        self.assertEqual(result.returncode, 64)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tools/campaign/resume_study.py b/tools/campaign/resume_study.py
+new file mode 100644
+--- /dev/null
++++ b/tools/campaign/resume_study.py
+@@ -0,0 +1,205 @@
++#!/usr/bin/env python3
++"""Banc de rejeu de l'étude de reprise de session, Python 3.9, bibliothèque standard.
++
++Chaque tâche est rejouée deux fois sur un clone propre du kit, avec un faux échec forcé à la première tentative :
++`reprise` (session reprise) puis `sans-reprise` (WORKSPACE_DELEGATE_RESUME=0). Chaque passage est fermé en `--abandoned`
++(jamais de fusion). Une ligne par passage dans `<out>/results.jsonl`, le tableau dans `<out>/resultats.md`.
++
++Codes : 0 fini ; 64 usage invalide, projet non propre ou tâche inconnue (rien n'est lancé ni écrit)."""
++import argparse
++import json
++import os
++from pathlib import Path
++import re
++import shutil
++import subprocess
++import sys
++
++sys.dont_write_bytecode = True
++
++MODES = ('reprise', 'sans-reprise')
++TOKEN_KEYS = (('input', 'input'), ('cache_read', 'cached_input'), ('cache_write', 'cache_creation'), ('output', 'output'))
++HEADER = ('| Tâche | Mode | Issue | Tentatives | Durée (s) | 2e tentative (s) | Cache lu | Cache écrit | Entrée | Sortie |\n'
++          '|---|---|---|---|---|---|---|---|---|---|\n')
++DELEGATE_TIMEOUT = 3600
++
++
++class Usage(Exception):
++    pass
++
++
++class Parser(argparse.ArgumentParser):
++    def error(self, message):
++        print('resume_study.py: ' + message, file=sys.stderr)
++        sys.exit(64)
++
++
++def validate(args):
++    """Return [(task id, source fiche text, hidden tests dir, base commit)]; raise Usage on any gap."""
++    project, source = Path(args.project), Path(args.source)
++    ids = [name.strip() for name in args.tasks.split(',')]
++    if not ids or any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', name) for name in ids) or len(set(ids)) != len(ids):
++        raise Usage('liste de tâches invalide : ' + args.tasks)
++    if not project.is_dir() or not source.is_dir():
++        raise Usage('projet ou kit source introuvable')
++    status = subprocess.run(['git', '-C', str(project), 'status', '--porcelain'], text=True, capture_output=True)
++    if status.returncode or status.stdout.strip():
++        raise Usage('projet absent de Git ou non propre : ' + str(project))
++    tasks = []
++    for name in ids:
++        fiche = source / '.workspace/tasks' / (name + '.md')
++        tests = source / '.workspace/acceptance' / name
++        state = source / '.workspace/orchestration/tasks' / name / 'state.json'
++        try:
++            base = json.loads(state.read_text(encoding='utf-8'))['base_commit']
++            text = fiche.read_text(encoding='utf-8')
++        except (OSError, ValueError, KeyError, TypeError):
++            raise Usage('tâche inconnue ou incomplète : ' + name)
++        if not tests.is_dir() or not isinstance(base, str) or not base:
++            raise Usage('tâche inconnue ou incomplète : ' + name)
++        tasks.append((name, text, tests, base))
++    return tasks
++
++
++def study_fiche(text, study_id, agent):
++    """Rewrite id, agent and attempts in the header only; the body is untouched."""
++    lines = text.split('\n')
++    end = next((i for i in range(1, len(lines)) if lines[i].rstrip() == '---'), None) if lines[0].rstrip() == '---' else None
++    if end is None:
++        raise Usage('fiche sans en-tête')
++    wanted = {'id': study_id, 'agent': agent, 'attempts': '2'}
++    header = []
++    for line in lines[1:end]:
++        key = line.split(':', 1)[0] if ':' in line else None
++        header.append('%s: %s' % (key, wanted.pop(key)) if key in wanted and not line.startswith((' ', '\t')) else line)
++    header += ['%s: %s' % item for item in wanted.items()]
++    return '\n'.join([lines[0]] + header + lines[end:])
++
++
++def passes_done(results):
++    done = set()
++    for row in read_rows(results):
++        if 'error' not in row:
++            done.add((row.get('task'), row.get('mode')))
++    return done
++
++
++def read_rows(results):
++    rows = []
++    if results.is_file():
++        for line in results.read_text(encoding='utf-8').splitlines():
++            try:
++                row = json.loads(line)
++            except ValueError:
++                continue
++            if isinstance(row, dict):
++                rows.append(row)
++    return rows
++
++
++def run(project, command, env, timeout=None):
++    try:
++        done = subprocess.run(command, cwd=project, env=env, text=True, capture_output=True, timeout=timeout)
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return 1, '%s : %s' % (type(exc).__name__, exc)
++    return done.returncode, (done.stdout + done.stderr)[-400:]
++
++
++def one_pass(project, agent, task, mode):
++    name, text, tests, base = task
++    study_id = '%s-etude-%s' % (name, mode)
++    row = dict(task=name, mode=mode, study_id=study_id, outcome=None, attempts=None, duration_seconds=None,
++               second_attempt_seconds=None, tokens=dict.fromkeys(('input', 'cache_read', 'cache_write', 'output')))
++    fiche = project / '.workspace/tasks' / (study_id + '.md')
++    fiche.parent.mkdir(parents=True, exist_ok=True)
++    fiche.write_text(study_fiche(text, study_id, agent), encoding='utf-8')
++    target = project / '.workspace/acceptance' / study_id
++    shutil.rmtree(target, ignore_errors=True)
++    shutil.copytree(tests, target)
++    env = {k: v for k, v in os.environ.items() if k not in ('WORKSPACE_AGENT_ROOT', 'WORKSPACE_DELEGATE_RESUME')}
++    env['WORKSPACE_STUDY_FORCE_FAIL'] = '1'
++    if mode == 'sans-reprise':
++        env['WORKSPACE_DELEGATE_RESUME'] = '0'
++    relative = '.workspace/tasks/%s.md' % study_id
++    code, detail = run(project, ['bash', 'scripts/task-workspace.sh', 'prepare', relative, '--base', base], env)
++    if code:
++        row['error'] = 'prepare en échec : ' + detail
++        return row
++    run(project, ['bash', 'scripts/delegate.sh', relative], env, DELEGATE_TIMEOUT)
++    try:
++        status = json.loads((project / '.workspace/run/delegate' / study_id / 'status.json').read_text(encoding='utf-8'))
++        metrics = status.get('metrics') or {}
++        durations = metrics.get('attempt_durations_seconds') or []
++        tokens = metrics.get('tokens') or {}
++        row.update(outcome=status.get('outcome'), attempts=status.get('attempts'), duration_seconds=metrics.get('duration_seconds'),
++                   second_attempt_seconds=durations[1] if len(durations) > 1 else None,
++                   tokens={key: tokens.get(source) for key, source in TOKEN_KEYS})
++    except (OSError, ValueError, AttributeError):
++        row['error'] = 'status.json illisible'
++    code, detail = run(project, ['bash', 'scripts/task-workspace.sh', 'close', study_id, '--abandoned', '--force'], env)
++    if code and 'error' not in row:
++        row['error'] = 'close en échec : ' + detail
++    return row
++
++
++def cell(value):
++    if isinstance(value, float):
++        value = round(value, 1)
++    return '-' if value is None else str(value)
++
++
++def write_table(out):
++    latest = {}
++    for row in read_rows(out / 'results.jsonl'):
++        latest[(row.get('task'), row.get('mode'))] = row
++    rows = list(latest.values())
++    lines = []
++    for row in rows:
++        tokens = row.get('tokens') or {}
++        lines.append([row.get('task'), row.get('mode'), row.get('outcome') if 'error' not in row else 'erreur',
++                      row.get('attempts'), row.get('duration_seconds'), row.get('second_attempt_seconds'),
++                      tokens.get('cache_read'), tokens.get('cache_write'), tokens.get('input'), tokens.get('output')])
++    for mode in MODES:
++        part = [row for row in rows if row.get('mode') == mode]
++        total = lambda get: sum(v for v in map(get, part) if isinstance(v, (int, float)))
++        lines.append(['Total ' + mode, '', '', '', total(lambda r: r.get('duration_seconds')),
++                      total(lambda r: r.get('second_attempt_seconds'))]
++                     + [total(lambda r, k=k: (r.get('tokens') or {}).get(k)) for k in ('cache_read', 'cache_write', 'input', 'output')])
++    body = ''.join('| %s |\n' % ' | '.join(cell(v) if v != '' else '' for v in line) for line in lines)
++    (out / 'resultats.md').write_text(HEADER + body, encoding='utf-8')
++
++
++def main(argv=None):
++    parser = Parser(description=__doc__.split('\n')[0])
++    parser.add_argument('--project', required=True)
++    parser.add_argument('--source', required=True)
++    parser.add_argument('--tasks', required=True)
++    parser.add_argument('--agent', default='claude-haiku')
++    parser.add_argument('--out', required=True)
++    args = parser.parse_args(argv)
++    try:
++        tasks = validate(args)
++    except Usage as exc:
++        print('resume_study.py: ' + str(exc), file=sys.stderr)
++        return 64
++    project, out = Path(args.project), Path(args.out)
++    out.mkdir(parents=True, exist_ok=True)
++    results = out / 'results.jsonl'
++    for task in tasks:
++        for mode in MODES:
++            if (task[0], mode) in passes_done(results):
++                continue
++            try:
++                row = one_pass(project, args.agent, task, mode)
++            except (OSError, Usage) as exc:
++                row = dict(task=task[0], mode=mode, study_id='%s-etude-%s' % (task[0], mode), outcome=None, attempts=None,
++                           duration_seconds=None, second_attempt_seconds=None, tokens={}, error=str(exc))
++            with results.open('a', encoding='utf-8') as handle:
++                handle.write(json.dumps(row, ensure_ascii=False) + '\n')
++            write_table(out)
++    write_table(out)
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

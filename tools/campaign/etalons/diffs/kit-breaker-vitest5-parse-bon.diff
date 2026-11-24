@@ -1,0 +1,46 @@
+diff --git a/template/scripts/lib/breaker.py b/template/scripts/lib/breaker.py
+--- a/template/scripts/lib/breaker.py
++++ b/template/scripts/lib/breaker.py
+@@ -116,7 +116,7 @@
+         if isinstance(data, dict) and data.get('breaker_result') is True:
+             return data
+     try:
+-        data = json.loads(out[out.index('{'):])
++        data = json.JSONDecoder().raw_decode(out, out.index('{'))[0]
+         results = [a for t in data['testResults'] for a in t['assertionResults']]
+         failed = [a for a in results if a['status'] == 'failed']
+         return dict(tests=len(results), failures=len(failed),
+diff --git a/tests/test_breaker.py b/tests/test_breaker.py
+--- a/tests/test_breaker.py
++++ b/tests/test_breaker.py
+@@ -7,6 +7,8 @@
+ import time
+ import unittest
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'template/scripts/lib'))
++import breaker
+ import test_delegate as fixtures
+ 
+ if os.environ.get('WORKSPACE_TESTS') == 'fast':
+@@ -236,3 +238,21 @@
+         self.assertEqual([r['test'] for r in self.report()['retained']], ['__breaker__/test_vitest.test.ts'])
+         self.assertFalse((self.wt / '.vitest').exists())
+         self.assertTrue(any('--outputFile.json=/dev/stdout' in c for c in self.get_docker_calls()))
++
++    def test_result_data_ignores_vitest5_trailer_after_json(self):
++        # Vitest 5 appends its trailer on the same line as the JSON, without a newline.
++        report = {'numRuntimeErrorTestSuites': 0, 'testResults': [{'assertionResults': [
++            {'status': 'passed', 'failureMessages': []},
++            {'status': 'failed', 'failureMessages': ['expected 1 to be 2']},
++        ]}]}
++        data = breaker.result_data(json.dumps(report) + 'JSON report written to /dev/stdout\n')
++        self.assertEqual(data['tests'], 2)
++        self.assertEqual(data['failures'], 1)
++        self.assertEqual(data['errors'], 0)
++        self.assertEqual(data['skipped'], 0)
++        self.assertEqual(data['message'], 'expected 1 to be 2')
++
++    def test_result_data_without_json_keeps_fallback(self):
++        data = breaker.result_data('no report here\n')
++        self.assertEqual(data, dict(tests=0, failures=0, errors=1, skipped=0,
++                                    message='Diagnostic de test absent.'))

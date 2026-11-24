@@ -1,0 +1,312 @@
+diff --git a/template/scripts/lib/orchestrator.py b/template/scripts/lib/orchestrator.py
+--- a/template/scripts/lib/orchestrator.py
++++ b/template/scripts/lib/orchestrator.py
+@@ -11,6 +11,7 @@
+ import json
+ import os
+ from pathlib import Path
++import re
+ import shutil
+ import socket
+ import subprocess
+@@ -24,9 +25,13 @@
+ 
+ LOCK_PATH = '.workspace/orchestrator.json'
+ TASKS_GLOB = '.workspace/orchestration/tasks/*/state.json'
++CAMPAIGN_TASKS_GLOB = '.workspace/campaign/*/.workspace/orchestration/tasks/*/state.json'
+ ORCHESTRATOR_ID = 'orchestrator'
+ ACTIVE_STATUSES = ('prepared', 'running', 'merge_conflict', 'integration_failed')
+-PROCESS_MARKERS = ('claude -p', 'codex', 'campaign.py')
++SHELLS = ('sh', 'bash', 'zsh', 'dash', 'fish', 'ksh')
++MAX_ANCESTORS = 16
++AGENT_MARKERS = ('claude -p', 'campaign.py')
++CODEX_EXEC = re.compile(r'\bcodex(@[\w.-]+)?\s+exec\s')
+ COMMAND_LIMIT = 160
+ SUBPROCESS_TIMEOUT = 10
+ EXIT_HELD = 3
+@@ -65,6 +70,52 @@
+         raise
+ 
+ 
++def _command_name(text):
++    """Nom de commande nu : sans chemin ni tiret initial (`-zsh` de login)."""
++    return os.path.basename(text.strip()).lstrip('-')
++
++
++def _process_info(pid):
++    """(pid parent, nom de commande) lus par `ps`, sinon par `/proc` ; `None` si illisible."""
++    if shutil.which('ps'):
++        try:
++            done = subprocess.run(['ps', '-o', 'ppid=,comm=', '-p', str(pid)], stdin=subprocess.DEVNULL,
++                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++                                  universal_newlines=True, timeout=SUBPROCESS_TIMEOUT)
++        except (OSError, subprocess.SubprocessError):
++            return None
++        fields = done.stdout.split(None, 1)
++        if done.returncode != 0 or len(fields) != 2 or not fields[0].isdigit():
++            return None
++        return int(fields[0]), _command_name(fields[1])
++    try:
++        stat = Path('/proc/%d/stat' % pid).read_text(encoding='utf-8')
++    except (OSError, ValueError):
++        return None
++    # Le nom est entre parenthèses et peut en contenir : on coupe au dernier `)`.
++    head, _, tail = stat.rpartition(')')
++    fields = tail.split()
++    if len(fields) < 2 or not fields[1].isdigit():
++        return None
++    return int(fields[1]), _command_name(head.partition('(')[2])
++
++
++def _session_pid(start):
++    """Premier ancêtre qui n'est pas un shell, à partir de `start` ; pid 1 n'est jamais retenu."""
++    pid = start
++    for _ in range(MAX_ANCESTORS):
++        info = _process_info(pid)
++        if info is None:
++            break
++        parent, name = info
++        if name not in SHELLS:
++            return pid
++        if parent <= 1:
++            break
++        pid = parent
++    return pid
++
++
+ def claim(root, args):
+     path = _lock_path(root)
+     if os.path.lexists(path) and not args.force:
+@@ -73,7 +124,7 @@
+         print('verrou déjà pris par la session %s ; --force pour le remplacer' % (name or 'inconnue'),
+               file=sys.stderr)
+         return EXIT_HELD
+-    pid = args.pid if args.pid is not None else os.getppid()
++    pid = args.pid if args.pid is not None else _session_pid(os.getppid())
+     data = {
+         'session': args.session or '%s-%d' % (socket.gethostname(), pid),
+         'model': args.model or 'inconnu',
+@@ -127,19 +178,50 @@
+         held.get('session'), held.get('model'), held.get('started_at'), held.get('pid'), state)
+ 
+ 
+-def _task_lines(root):
+-    lines = []
+-    for state_file in sorted(root.glob(TASKS_GLOB)):
+-        try:
+-            safety.check_no_symlinks(state_file, root)
+-            data = json.loads(state_file.read_text(encoding='utf-8'))
+-            status = data['status'] if isinstance(data, dict) else None
+-        except (OSError, ValueError, KeyError):
+-            status = None
+-        if not isinstance(status, str):
+-            lines.append('tâche illisible : %s' % state_file.parent.name)
+-        elif status in ACTIVE_STATUSES:
+-            lines.append('tâche active : %s (%s)' % (state_file.parent.name, status))
++def _task_line(root, state_file):
++    """Ligne d'une tâche active ou illisible ; `None` pour une tâche terminée."""
++    try:
++        safety.check_no_symlinks(state_file, root)
++        data = json.loads(state_file.read_text(encoding='utf-8'))
++        status = data['status'] if isinstance(data, dict) else None
++    except (OSError, ValueError, KeyError):
++        status = None
++    if not isinstance(status, str):
++        return 'tâche illisible : %s' % state_file.parent.name
++    if status in ACTIVE_STATUSES:
++        return 'tâche active : %s (%s)' % (state_file.parent.name, status)
++    return None
++
++
++def _repo_task_lines(repo, suffix=''):
++    """Tâches du dépôt, puis celles de ses bras de campagne ; `suffix` ajoute le chemin du dépôt."""
++    lines = [_task_line(repo, state_file)
++             for pattern in (TASKS_GLOB, CAMPAIGN_TASKS_GLOB)
++             for state_file in sorted(repo.glob(pattern))]
++    return [line + suffix for line in lines if line]
++
++
++def _declared_repos(root, held):
++    """Chemins du verrou autres que le dépôt courant, sans doublon ni dépôt absent."""
++    if not held or not isinstance(held.get('repos'), list):
++        return []
++    seen = {os.path.realpath(str(root))}
++    found = []
++    for text in held['repos']:
++        if not isinstance(text, str) or not text:
++            continue
++        real = os.path.realpath(text)
++        if real in seen or not os.path.isdir(real):
++            continue
++        seen.add(real)
++        found.append(text)
++    return found
++
++
++def _task_lines(root, held):
++    lines = _repo_task_lines(root)
++    for text in _declared_repos(root, held):
++        lines += _repo_task_lines(Path(text), ' [%s]' % text)
+     return lines or ['tâches actives : aucune']
+ 
+ 
+@@ -180,6 +262,11 @@
+     return found
+ 
+ 
++def _is_agent_process(command):
++    """Agents d'orchestration seuls : `claude -p`, `campaign.py`, relais Codex lancé en `exec`."""
++    return any(marker in command for marker in AGENT_MARKERS) or CODEX_EXEC.search(command) is not None
++
++
+ def _process_lines():
+     own = {os.getpid(), os.getppid()}
+     try:
+@@ -188,12 +275,15 @@
+         processes = []
+     lines = ['processus : %d %s' % (pid, ' '.join(command.split())[:COMMAND_LIMIT])
+              for pid, command in processes
+-             if pid not in own and any(marker in command for marker in PROCESS_MARKERS)]
++             if pid not in own and _is_agent_process(command)]
+     return lines or ['processus : aucun']
+ 
+ 
+ def status(root, _args):
+-    for line in [_lock_line(root)] + _task_lines(root) + _container_lines() + _process_lines():
++    path = _lock_path(root)
++    held = _read_lock(path) if os.path.lexists(path) else None
++    lines = [_lock_line(root)] + _task_lines(root, held) + _container_lines() + _process_lines()
++    for line in lines:
+         print(line)
+     return 0
+ 
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -7,9 +7,12 @@
+ import sys
+ import tempfile
+ import unittest
++from unittest import mock
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ BASH = shutil.which('bash')
++sys.path.insert(0, str(ROOT / 'template/scripts/lib'))
++import orchestrator  # noqa: E402
+ 
+ 
+ def run(root, env, *args):
+@@ -208,6 +211,61 @@
+         self.fake_ps(listing)
+         self.assertIn('processus : aucun', self.status_lines())
+ 
++    def test_status_ignores_chatgpt_codex_services(self):
++        listing = self.bin.parent / 'ps.txt'
++        listing.write_text('\n'.join([
++            '  201 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
++            '  202 Codex (Service)',
++            '  203 /Applications/ChatGPT.app/Contents/Resources/codex app-server',
++            '  204 /Applications/ChatGPT.app/Contents/Resources/codex --flag exec-server',
++            '  205 Codex Computer Use',
++            '  206 vim codex-notes.md',
++            '  207 /opt/homebrew/bin/codex exec "tâche"',
++            '  208 node /usr/lib/node_modules/@openai/codex@0.162.1 exec "x"']) + '\n')
++        self.fake_ps(listing)
++        processes = [line for line in self.status_lines() if line.startswith('processus')]
++        self.assertEqual(processes, ['processus : 207 /opt/homebrew/bin/codex exec "tâche"',
++                                     'processus : 208 node /usr/lib/node_modules/@openai/codex@0.162.1 exec "x"'])
++
++    def test_claim_without_pid_records_the_session_process_behind_shells(self):
++        # Python appelant -> bash -c -> bash orchestrator.sh (exec python3) : le pid de l'appelant est retenu.
++        env = self.make_env(self.bin, *os.environ.get('PATH', '').split(os.pathsep))
++        done = subprocess.run([BASH, '-c', 'bash "$0" claim; true', str(self.root / 'scripts/orchestrator.sh')],
++                              env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
++                              stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8')
++        self.assertEqual(done.returncode, 0, done.stderr)
++        self.assertEqual(json.loads(self.lock.read_text(encoding='utf-8'))['pid'], os.getpid())
++
++    def test_status_lists_tasks_of_declared_repos_and_campaign_arms(self):
++        other = self.root.parent / 'other'
++        self.write_task(self.root / '.workspace/orchestration/tasks/z-own', 'running')
++        self.write_task(self.root / '.workspace/campaign/u1/.workspace/orchestration/tasks/c-run', 'running')
++        self.write_task(other / '.workspace/orchestration/tasks/x-run', 'running')
++        self.write_task(other / '.workspace/campaign/u2/.workspace/orchestration/tasks/y-conf', 'merge_conflict')
++        self.write_task(other / '.workspace/orchestration/tasks/w-merged', 'merged')
++        (other / '.workspace/orchestration/tasks/v-link').mkdir(parents=True)
++        outside = self.root.parent / 'outside-state.json'
++        outside.write_text('{"status": "running"}')
++        (other / '.workspace/orchestration/tasks/v-link/state.json').symlink_to(outside)
++        missing = self.root.parent / 'absent'
++        done = run(self.root, self.env, 'claim', '--session', 's', '--pid', str(os.getpid()),
++                   '--repos', '%s,%s' % (other, missing))
++        self.assertEqual(done.returncode, 0, done.stderr)
++        self.assertEqual([line for line in self.status_lines() if line.startswith('tâche')], [
++            'tâche active : z-own (running)', 'tâche active : c-run (running)',
++            'tâche illisible : v-link [%s]' % other,
++            'tâche active : x-run (running) [%s]' % other,
++            'tâche active : y-conf (merge_conflict) [%s]' % other])
++
++    def test_status_without_lock_lists_only_the_current_repo(self):
++        other = self.root.parent / 'other'
++        self.write_task(other / '.workspace/orchestration/tasks/x-run', 'running')
++        self.assertIn('tâches actives : aucune', self.status_lines())
++
++    def write_task(self, directory, status):
++        directory.mkdir(parents=True, exist_ok=True)
++        (directory / 'state.json').write_text(json.dumps({'status': status}))
++
+     @unittest.skipUnless(os.path.isdir('/proc/self'), 'pas de /proc')
+     def test_status_reads_proc_when_ps_is_absent(self):
+         env, _ = self.no_docker_env()
+@@ -226,5 +284,51 @@
+         self.assertFalse(self.lock.exists())
+ 
+ 
++class SessionPidTests(unittest.TestCase):
++
++    def setUp(self):
++        self.table = {}
++        patcher = mock.patch.object(orchestrator, '_process_info', side_effect=lambda pid: self.table.get(pid))
++        patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def test_skips_shells_and_keeps_the_first_other_process(self):
++        self.table = {10: (11, 'bash'), 11: (12, 'zsh'), 12: (13, 'python3'), 13: (1, 'launchd')}
++        self.assertEqual(orchestrator._session_pid(10), 12)
++
++    def test_a_shell_whose_parent_is_init_is_kept(self):
++        self.table = {10: (1, 'bash')}
++        self.assertEqual(orchestrator._session_pid(10), 10)
++
++    def test_init_is_never_recorded_in_place_of_the_last_other_process(self):
++        self.table = {10: (1, 'sh'), 1: (0, 'launchd')}
++        self.assertNotEqual(orchestrator._session_pid(10), 1)
++
++    def test_stops_after_sixteen_levels_of_shells(self):
++        self.table = {pid: (pid + 1, 'bash') for pid in range(10, 27)}
++        self.table[27] = (1, 'python3')
++        self.assertEqual(orchestrator._session_pid(10), 26)
++
++    def test_unreadable_process_keeps_the_current_pid(self):
++        self.assertEqual(orchestrator._session_pid(10), 10)
++        self.table = {10: (11, 'bash')}
++        self.assertEqual(orchestrator._session_pid(10), 11)
++
++    def test_command_name_drops_path_and_login_dash(self):
++        self.assertEqual(orchestrator._command_name('-zsh'), 'zsh')
++        self.assertEqual(orchestrator._command_name('/bin/bash'), 'bash')
++        self.assertEqual(orchestrator._command_name(' python3 '), 'python3')
++
++
++class ProcessInfoTests(unittest.TestCase):
++
++    @unittest.skipUnless(os.path.isdir('/proc/self'), 'pas de /proc')
++    def test_process_info_reads_proc_without_ps(self):
++        with mock.patch.object(orchestrator.shutil, 'which', return_value=None):
++            info = orchestrator._process_info(os.getpid())
++        self.assertEqual(info[0], os.getppid())
++        self.assertTrue(info[1])
++
++
+ if __name__ == '__main__':
+     unittest.main()

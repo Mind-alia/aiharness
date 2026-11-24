@@ -1,0 +1,98 @@
+diff --git a/template/docs/FICHE-TACHE.md b/template/docs/FICHE-TACHE.md
+--- a/template/docs/FICHE-TACHE.md
++++ b/template/docs/FICHE-TACHE.md
+@@ -5,6 +5,9 @@
+ 
+ ## Interface imposée
+ Fixer les fichiers, noms exportés, signatures et formes des données.
++
++L'en-tête facultatif `type:` (`code`, `docs`, `test`, `security` ou `exploration`) range la tâche dans l'écran « l'Usine » ;
++sans lui, `mode: review` vaut `exploration`, `agent: antigravity` vaut `docs`, et tout autre cas vaut `code`.
+ 
+ ## Règles numérotées dans l'ordre d'application
+ 1. Décrire la première règle et sa priorité.
+diff --git a/template/scripts/lib/mission.py b/template/scripts/lib/mission.py
+--- a/template/scripts/lib/mission.py
++++ b/template/scripts/lib/mission.py
+@@ -151,6 +151,7 @@
+                 "schema_version": 1,
+                 "task_id": task_id,
+                 "agent": agent,
++                "type": task_data['type'],
+                 "allowed": allowed,
+                 "base_commit": base_commit,
+                 "branch": branch_name,
+diff --git a/template/scripts/lib/task.py b/template/scripts/lib/task.py
+--- a/template/scripts/lib/task.py
++++ b/template/scripts/lib/task.py
+@@ -71,6 +71,7 @@
+     return value
+ 
+ 
++TASK_TYPES = ('code', 'docs', 'test', 'security', 'exploration')
+ FULL_GATE_MESSAGE = ('verify ne doit pas lancer la porte complète (scripts/gate.sh) : elle tourne à la fusion ; '
+                      'indiquer une commande ciblée, par exemple les tests des fichiers touchés, '
+                      'ou scripts/gate.sh --quick.')
+@@ -131,6 +132,15 @@
+     data.setdefault('mode', 'write')
+     if data['mode'] not in ('write', 'review'):
+         raise ValueError('mode doit être write ou review')
++    if 'type' in data:
++        if data['type'] not in TASK_TYPES:
++            raise ValueError('type doit être code, docs, test, security ou exploration')
++    elif data['mode'] == 'review':
++        data['type'] = 'exploration'
++    elif data['agent'] == 'antigravity':
++        data['type'] = 'docs'
++    else:
++        data['type'] = 'code'
+     if any(not isinstance(item, str) or not item for item in data['allowed']):
+         raise ValueError('allowed doit contenir des chemins non vides')
+     attempts = data.get('attempts', '2')
+diff --git a/tests/test_task.py b/tests/test_task.py
+--- a/tests/test_task.py
++++ b/tests/test_task.py
+@@ -87,3 +87,37 @@
+         for path in ('../escape', '/tmp/test', 'a/../test', 'a//test'):
+             with self.subTest(path=path), self.assertRaises(ValueError):
+                 self.read(base + '\nacceptance: [' + path + ']\nacceptance_verify: true')
++
++    def test_type_accepts_each_listed_value(self):
++        base = 'id: demo\nagent: codex\nallowed: []'
++        for value in ('code', 'docs', 'test', 'security', 'exploration'):
++            with self.subTest(type=value):
++                self.assertEqual(self.read(base + '\ntype: ' + value)['type'], value)
++
++    def test_type_refuses_unknown_values(self):
++        base = 'id: demo\nagent: codex\nallowed: []'
++        for value in ('', 'Docs', 'CODE', 'documentation', 'code, docs'):
++            with self.subTest(type=value), self.assertRaisesRegex(ValueError, 'type'):
++                self.read(base + '\ntype: ' + value)
++
++    def test_type_defaults_from_mode_then_agent(self):
++        base = 'id: demo\nallowed: []'
++        self.assertEqual(self.read(base + '\nagent: codex\nmode: review')['type'], 'exploration')
++        self.assertEqual(self.read(base + '\nagent: antigravity')['type'], 'docs')
++        self.assertEqual(self.read(base + '\nagent: claude-haiku')['type'], 'code')
++        self.assertEqual(self.read(base + '\nagent: codex\nmode: write')['type'], 'code')
++
++    def test_type_default_priority_review_before_antigravity(self):
++        base = 'id: demo\nallowed: []'
++        self.assertEqual(self.read(base + '\nagent: antigravity\nmode: review')['type'], 'exploration')
++
++    def test_explicit_type_wins_over_defaults(self):
++        base = 'id: demo\nallowed: []'
++        self.assertEqual(self.read(base + '\nagent: codex\nmode: review\ntype: code')['type'], 'code')
++        self.assertEqual(self.read(base + '\nagent: antigravity\ntype: test')['type'], 'test')
++        self.assertEqual(self.read(base + '\nagent: codex\ntype: security')['type'], 'security')
++
++    def test_duplicate_type_is_rejected(self):
++        base = 'id: demo\nagent: codex\nallowed: []'
++        with self.assertRaisesRegex(ValueError, 'répété'):
++            self.read(base + '\ntype: code\ntype: docs')
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

@@ -1,0 +1,99 @@
+
+[TRUNCATED]
+diff --git a/template/scripts/lib/exchange.py b/template/scripts/lib/exchange.py
+--- a/template/scripts/lib/exchange.py
++++ b/template/scripts/lib/exchange.py
+@@ -244,7 +244,15 @@
+     task_exchange_log.mkdir(parents=True, exist_ok=True, mode=0o700)
+     task_exchange_log.chmod(0o700)
+ 
+-    next_req = 1
++    def skip_answered(number: int) -> int:
++        # Une requête qui a déjà un résultat (délégation précédente de la même tâche) n'est jamais rejouée.
++        while True:
++            answered = results_dir / f"{number:03d}.json"
++            if not answered.is_file() or answered.is_symlink():
++                return number
++            number += 1
++
++    next_req = skip_answered(1)
+ 
+     def sync_context() -> None:
+         try:
+@@ -295,7 +303,7 @@
+             except Exception:
+                 pass
+ 
+-            next_req += 1
++            next_req = skip_answered(next_req + 1)
+             continue
+ 
+         if stop_event.is_set():
+
+[TRUNCATED]
+diff --git a/tests/test_exchange.py b/tests/test_exchange.py
+--- a/tests/test_exchange.py
++++ b/tests/test_exchange.py
+@@ -342,6 +342,56 @@
+         )
+         self.assertEqual(res.returncode, 42)
+ 
++    def run_broker_until(self, task_id, done):
++        import exchange
++        stop_event = threading.Event()
++        broker_thread = threading.Thread(target=exchange.run_broker, args=(self.root, task_id, stop_event), daemon=True)
++        broker_thread.start()
++        deadline = time.monotonic() + 10
++        while not done() and time.monotonic() < deadline:
++            time.sleep(0.02)
++        self.stop_broker(stop_event, broker_thread)
++
++    def test_broker_does_not_replay_answered_requests(self):
++        task_id = 'test-no-replay'
++        self.prepare_exchange_task(task_id)
++        worktree = self.root / f'.workspace/worktrees/{task_id}'
++        requests_dir = worktree / '.workspace/exchange/requests'
++        results_dir = worktree / '.workspace/exchange/results'
++        log_dir = self.root / f'.workspace/orchestration/tasks/{task_id}/exchange'
++        requests_dir.mkdir(parents=True, exist_ok=True)
++        results_dir.mkdir(parents=True, exist_ok=True)
++
++        for number in (1, 2, 3):
++            (requests_dir / f'{number:03d}.json').write_text(json.dumps({'command': ['echo', str(number)]}))
++        previous = {}
++        for number in (1, 2):
++            previous[number] = json.dumps({'exit_code': 0, 'code': 0, 'output': f'old {number}\n'})
++            (results_dir / f'{number:03d}.json').write_text(previous[number])
++
++        executed = []
++
++        def fake_execute(root, tid, req_file, req_num, log):
++            executed.append(req_num)
++            return 0, f'new {req_num}\n'
++
++        with mock.patch('exchange.execute_request', side_effect=fake_execute):
++            self.run_broker_until(task_id, lambda: (results_dir / '003.json').is_file())
++        self.assertEqual(executed, [3])
++        for number in (1, 2):
++            self.assertEqual((results_dir / f'{number:03d}.json').read_text(), previous[number])
++            self.assertFalse((log_dir / f'result-{number:03d}.json').exists())
++        self.assertEqual(json.loads((results_dir / '003.json').read_text())['output'], 'new 3\n')
++        self.assertTrue((log_dir / 'result-003.json').is_file())
++
++        # Second lancement : toutes les requêtes ont un résultat, rien n'est rejoué.
++        executed.clear()
++        with mock.patch('exchange.execute_request', side_effect=fake_execute):
++            self.run_broker_until(task_id, lambda: True)
++        self.assertEqual(executed, [])
++        self.assertEqual((results_dir / '001.json').read_text(), previous[1])
++        self.assertEqual(json.loads((results_dir / '003.json').read_text())['output'], 'new 3\n')
++
+     def test_output_secrets_masked(self):
+         task_id = 'test-mask-secrets'
+         self.prepare_exchange_task(task_id)
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

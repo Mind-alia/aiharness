@@ -1,0 +1,296 @@
+diff --git a/tests/test_campaign.py b/tests/test_campaign.py
+--- a/tests/test_campaign.py
++++ b/tests/test_campaign.py
+@@ -1,6 +1,7 @@
+ import json
+ import os
+ from pathlib import Path
++import shlex
+ import subprocess
+ import sys
+ import tempfile
+@@ -13,7 +14,7 @@
+     def setUp(self):
+         self.tmp = tempfile.TemporaryDirectory()
+         self.addCleanup(self.tmp.cleanup)
+-        self.base = Path(self.tmp.name)
++        self.base = Path(self.tmp.name).resolve()  # /var est un lien vers /private/var sous macOS.
+         self.project = self.base / 'project'
+         self.project.mkdir()
+         self.git('init', '-b', 'initial')
+@@ -33,7 +34,8 @@
+ echo "$id"
+ done
+ ''')
+-        (scripts / 'task-workspace.sh').write_text('''echo "$*" >> .workspace/calls
++        # Les bras s'exécutent dans leur worktree : marqueurs et appels vivent dans le projet principal ($MAIN).
++        self.write_script('task-workspace', '''echo "$*" >> "$MAIN/.workspace/calls"
+ if [ "$1" = prepare ]; then
+ id=$(sed -n 's/^id: //p' "$2")
+ mkdir -p ".workspace/worktrees/$id"
+@@ -43,9 +45,9 @@
+ git commit --allow-empty -qm delivered
+ fi
+ ''')
+-        (scripts / 'delegate.sh').write_text('''mkdir -p .workspace/metrics
+-echo "delegate $*" >> .workspace/calls
+-if [ -f .workspace/quota ]; then
++        self.write_script('delegate', '''mkdir -p .workspace/metrics
++echo "delegate $*" >> "$MAIN/.workspace/calls"
++if [ -f "$MAIN/.workspace/quota" ]; then
+ printf '{"provider":"codex","role":"execution","quota":{"limit_reached":true}}\\n' >> .workspace/metrics/consumption.jsonl
+ exit 1
+ fi
+@@ -70,6 +72,15 @@
+     def git(self, *args):
+         return subprocess.check_output(['git', '-C', str(self.project)] + list(args), text=True).strip()
+ 
++    def write_script(self, name, body):
++        """Script factice du projet ; $MAIN désigne le checkout principal, où vivent les marqueurs."""
++        (self.project / 'scripts' / (name + '.sh')).write_text(
++            'MAIN=%s\nmkdir -p "$MAIN/.workspace"\n%s' % (shlex.quote(str(self.project)), body))
++
++    def worktrees(self):
++        listing = self.git('worktree', 'list', '--porcelain').splitlines()
++        return [Path(line[len('worktree '):]) for line in listing if line.startswith('worktree ')]
++
+     def run_campaign(self, *options):
+         self.path.write_text(json.dumps(self.config))
+         return subprocess.run([sys.executable, str(SCRIPT), str(self.path), *options], text=True,
+@@ -79,13 +90,17 @@
+     def rows(self):
+         return [json.loads(x) for x in (self.base / 'results.jsonl').read_text().splitlines()]
+ 
+-    def test_results_resume_and_branch_restoration(self):
++    def test_results_resume_and_main_branch_never_left(self):
+         result = self.run_campaign()
+         self.assertEqual(result.returncode, 0, result.stderr)
+         rows = self.rows()
+         self.assertEqual(len(rows), 4)
+         self.assertEqual(self.git('branch', '--show-current'), 'initial')
+         self.assertEqual(self.git('rev-parse', 'initial'), self.commit)
++        for k, row in enumerate(rows):
++            self.assertEqual(row['branch'], 'campagne/simple/%s/%d-%d' % (row['arm'], row['repetition'], k))
++            self.assertEqual(self.git('rev-parse', row['start_commit']), self.commit)
++            self.assertNotEqual(self.git('rev-parse', row['branch']), self.commit)  # livraison commitée sur la branche du bras
+         self.assertFalse((self.project / 'eval/hidden.py').exists())
+         self.assertEqual(rows[0]['evaluation']['passed'], 3)
+         self.assertTrue(rows[0]['gate']['statusline_binary_only'])
+@@ -97,6 +112,54 @@
+         self.assertEqual(self.run_campaign().returncode, 0)
+         self.assertEqual(self.rows(), rows)
+         self.assertTrue((self.base / 'results.md').exists())
++
++    def test_completed_arms_remove_their_worktree_and_keep_the_branch(self):
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual(len(rows), 4)
++        for row in rows:
++            self.assertEqual(row['status'], 'completed')
++            self.assertEqual(Path(row['arm_worktree']),
++                             self.project / '.workspace/campaign' / ('camp-simple-%s-%d-%d' % (
++                                 row['arm'], row['repetition'], rows.index(row))))
++            self.assertIs(row['arm_worktree_kept'], False)
++            self.assertFalse(Path(row['arm_worktree']).exists())
++            self.assertTrue(self.git('rev-parse', '--verify', row['branch']))
++        self.assertEqual(self.worktrees(), [self.project])
++        self.assertEqual(self.git('stash', 'list'), '')
++
++    def test_main_checkout_keeps_its_branch_and_head_at_every_step(self):
++        steps = self.base / 'steps'
++        trace = ('echo "$(basename "$0") $(git -C "$MAIN" branch --show-current) '
++                 '$(git -C "$MAIN" rev-parse HEAD) $(pwd -P)" >> %s\n' % shlex.quote(str(steps)))
++        for name in ('prepare-task', 'task-workspace', 'delegate', 'breaker', 'gate'):
++            script = self.project / 'scripts' / (name + '.sh')
++            body = script.read_text()
++            if not body.startswith('MAIN='):
++                body = 'MAIN=%s\n' % shlex.quote(str(self.project)) + body
++            script.write_text(body.replace('\n', '\n' + trace, 1))
++        self.config['tasks'][0]['evaluation_command'] = (
++            'echo "evaluation $(git -C %s branch --show-current) $(pwd -P)" >> %s; '
++            'echo \'{"passed":1,"total":1}\'' % (shlex.quote(str(self.project)), shlex.quote(str(steps))))
++        self.git('add', '.')
++        self.git('commit', '-qm', 'traced scripts')
++        head = self.git('rev-parse', 'HEAD')
++        self.config['start_commit'] = head
++        self.assertEqual(self.run_campaign().returncode, 0)
++        lines = [line.split() for line in steps.read_text().splitlines()]
++        self.assertGreater(len(lines), 20)
++        for line in lines:
++            if line[0] == 'evaluation':
++                branch, cwd = line[1], line[2]
++            else:
++                branch, cwd = line[1], line[3]
++                self.assertEqual(line[2], head, line)
++            self.assertEqual(branch, 'initial', line)
++            self.assertTrue(cwd.startswith(str(self.project / '.workspace/campaign') + os.sep), line)
++        self.assertEqual({line[0] for line in lines},
++                         {'prepare-task.sh', 'task-workspace.sh', 'delegate.sh', 'breaker.sh', 'gate.sh', 'evaluation'})
++        self.assertEqual(self.git('branch', '--show-current'), 'initial')
++        self.assertEqual(self.git('rev-parse', 'HEAD'), head)
+ 
+     def test_campaign_normalizes_totals_and_propagates_unknowns_per_role(self):
+         self.config.update(arms=['codex-seul'], repetitions=1)
+@@ -143,6 +206,9 @@
+         self.assertEqual(self.run_campaign().returncode, 0)
+         order = [(r['task'], r['arm'], r['repetition']) for r in self.rows()]
+         (self.base / 'results.jsonl').unlink()
++        # Les branches de bras ne sont jamais supprimées par la campagne : un nouveau départ repart de k = 0.
++        for branch in self.git('branch', '--list', 'campagne/*', '--format=%(refname:short)').splitlines():
++            self.git('branch', '-D', branch)
+         self.assertEqual(self.run_campaign().returncode, 0)
+         self.assertEqual(order, [(r['task'], r['arm'], r['repetition']) for r in self.rows()])
+ 
+@@ -158,10 +224,19 @@
+         self.assertEqual(counts['unknown_token_calls'], 1)
+         self.assertEqual(self.rows()[0]['attempts'], 1)
+         self.assertEqual(self.git('branch', '--show-current'), 'initial')
++        stopped = self.rows()[0]
++        self.assertIs(stopped['arm_worktree_kept'], True)
++        self.assertTrue(Path(stopped['arm_worktree']).is_dir())
+         (self.project / '.workspace/quota').unlink()
+         self.assertEqual(self.run_campaign().returncode, 0)
+         self.assertEqual(len(self.rows()), 5)
+         self.assertEqual(self.rows()[-1]['status'], 'completed')
++        # Reprise : nouveau k, donc nouvelle branche et nouveau worktree ; celui du quota reste.
++        self.assertEqual(self.rows()[0], stopped)
++        self.assertTrue(Path(stopped['arm_worktree']).is_dir())
++        self.assertEqual(self.worktrees(), [self.project, Path(stopped['arm_worktree'])])
++        self.assertEqual(len({r['branch'] for r in self.rows()}), 5)
++        self.assertEqual(self.git('branch', '--show-current'), 'initial')
+         for resumed in self.rows()[1:]:
+             counts = resumed['consumption']['codex']['execution']
+             self.assertIsNotNone(counts['total_tokens'])
+@@ -177,7 +252,13 @@
+         self.assertEqual(self.git('branch', '--show-current'), 'initial')
+         self.assertEqual((self.project / 'src/code.txt').read_text(), 'base')
+         self.assertFalse((self.project / 'eval').exists())
+-        self.assertEqual(self.rows()[0]['evaluation']['exit'], 1)
++        row = self.rows()[0]
++        self.assertEqual(row['evaluation']['exit'], 1)
++        # Le bras est `completed` mais son worktree est sale : il reste, sans toucher au projet principal.
++        self.assertEqual(row['status'], 'completed')
++        self.assertIs(row['arm_worktree_kept'], True)
++        self.assertEqual((Path(row['arm_worktree']) / 'src/code.txt').read_text(), 'changed\n')
++        self.assertFalse((Path(row['arm_worktree']) / 'eval').exists())
+ 
+     def test_quota_in_planner_counts_orchestration(self):
+         self.config['arms'] = ['systeme-codex']
+@@ -217,11 +298,10 @@
+ 
+     def test_quota_word_in_identifier_is_a_failure_not_a_limit(self):
+         self.config.update(arms=['systeme-claude-haiku'], repetitions=2)
+-        script = self.project / 'scripts/delegate.sh'
+-        script.write_text('''mkdir -p .workspace/metrics
+-echo "delegate $*" >> .workspace/calls
+-if [ -f .workspace/fail-once ]; then
+-rm .workspace/fail-once
++        self.write_script('delegate', '''mkdir -p .workspace/metrics
++echo "delegate $*" >> "$MAIN/.workspace/calls"
++if [ -f "$MAIN/.workspace/fail-once" ]; then
++rm "$MAIN/.workspace/fail-once"
+ echo '{"id":"camp-t1-quota-systeme-claude-sonnet-1-0","attempts":1,"outcome":"failed"}'
+ exit 1
+ fi
+@@ -255,7 +335,7 @@
+     def fail_with_work(self):
+         """Real task worktrees; the delegate leaves uncommitted work then fails; close refuses a dirty worktree."""
+         self.config.update(arms=['systeme-claude-haiku'], repetitions=2)
+-        (self.project / 'scripts/task-workspace.sh').write_text('''echo "$*" >> .workspace/calls
++        self.write_script('task-workspace', '''echo "$*" >> "$MAIN/.workspace/calls"
+ if [ "$1" = prepare ]; then
+ id=$(sed -n 's/^id: //p' "$2")
+ git worktree add -q ".workspace/worktrees/$id" -b "workspace-task/$id"
+@@ -265,10 +345,10 @@
+ git commit --allow-empty -qm delivered
+ fi
+ ''')
+-        (self.project / 'scripts/delegate.sh').write_text('''echo "delegate $*" >> .workspace/calls
++        self.write_script('delegate', '''echo "delegate $*" >> "$MAIN/.workspace/calls"
+ id=$(basename "$1" .md)
+-if [ -f .workspace/fail-once ]; then
+-rm .workspace/fail-once
++if [ -f "$MAIN/.workspace/fail-once" ]; then
++rm "$MAIN/.workspace/fail-once"
+ printf 'agent work' > ".workspace/worktrees/$id/src/agent.txt"
+ echo '{"attempts":1,"outcome":"failed"}'
+ exit 1
+@@ -296,6 +376,14 @@
+         self.assertNotIn('cleanup_errors', rows[0])
+         self.assertEqual(self.git('status', '--porcelain'), '')
+         self.assertEqual(self.git('branch', '--show-current'), 'initial')
++        # Le bras en échec garde son worktree comme preuve ; le bras réussi retire le sien.
++        self.assertIs(rows[0]['arm_worktree_kept'], True)
++        self.assertEqual(self.git('-C', rows[0]['arm_worktree'], 'branch', '--show-current'), rows[0]['branch'])
++        self.assertIs(rows[1]['arm_worktree_kept'], False)
++        self.assertFalse(Path(rows[1]['arm_worktree']).exists())
++        self.assertEqual(self.worktrees(), [self.project, Path(rows[0]['arm_worktree'])])
++        for row in rows:
++            self.assertTrue(self.git('rev-parse', '--verify', row['branch']))
+ 
+     def test_discard_failed_restores_the_forced_close(self):
+         self.fail_with_work()
+@@ -305,6 +393,12 @@
+         self.assertEqual(rows[0]['status'], 'failed')
+         self.assertNotIn('failed_work', rows[0])
+         self.assertIn('--abandoned --force', (self.project / '.workspace/calls').read_text())
++        # --discard-failed retire aussi le worktree du bras ; sa branche reste.
++        for row in rows:
++            self.assertIs(row['arm_worktree_kept'], False)
++            self.assertFalse(Path(row['arm_worktree']).exists())
++            self.assertTrue(self.git('rev-parse', '--verify', row['branch']))
++        self.assertEqual(self.worktrees(), [self.project])
+ 
+     def test_evaluation_score_is_kept_when_it_fails_with_quota_word(self):
+         self.config.update(arms=['codex-seul'], repetitions=2)
+@@ -343,3 +437,50 @@
+         self.assertEqual(result.returncode, 75, result.stderr)
+         self.assertEqual([r['status'] for r in self.rows()], ['quota'])
+         self.assertEqual(self.git('branch', '--show-current'), 'initial')
++
++    def test_setup_runs_in_the_worktree_before_the_contracts(self):
++        record = shlex.quote(str(self.project / '.workspace/setup'))
++        self.config.update(arms=['codex-seul'], repetitions=1)
++        self.config['setup'] = ('pwd -P > %s; ls -A tasks >> %s 2>/dev/null; '
++                                'mkdir -p .workspace && touch .workspace/deps' % (record, record))
++        self.assertEqual(self.run_campaign().returncode, 0)
++        row = self.rows()[0]
++        self.assertEqual(row['status'], 'completed')
++        recorded = (self.project / '.workspace/setup').read_text().splitlines()
++        self.assertEqual(recorded, [row['arm_worktree']])  # dans le worktree, et aucun contrat encore
++        self.assertEqual(row['commands'][0]['args'][:2], ['bash', '-c'])
++        self.assertEqual(row['commands'][0]['exit'], 0)
++        self.assertEqual(row['commands'][1]['args'][1:3], ['scripts/task-workspace.sh', 'prepare'])
++        self.assertFalse((self.project / '.workspace/deps').exists())
++        self.assertFalse((self.project / 'tasks').exists())
++
++    def test_setup_accepts_an_argv_list(self):
++        self.config.update(arms=['codex-seul'], repetitions=1)
++        self.config['setup'] = ['sh', '-c', 'pwd -P > ' + shlex.quote(str(self.project / '.workspace/argv-setup'))]
++        self.assertEqual(self.run_campaign().returncode, 0)
++        row = self.rows()[0]
++        self.assertEqual(row['commands'][0]['args'], self.config['setup'])
++        self.assertEqual((self.project / '.workspace/argv-setup').read_text().strip(), row['arm_worktree'])
++
++    def test_failed_setup_fails_the_arm_and_never_counts_as_quota(self):
++        self.config.update(arms=['systeme-claude-haiku'], repetitions=1)
++        limit = '{"provider":"codex","role":"execution","quota":{"limit_reached":true}}'
++        self.config['setup'] = ("mkdir -p .workspace/metrics; echo '%s' >> .workspace/metrics/consumption.jsonl; "
++                                "echo 'usage limit reached'; exit 3" % limit)
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 1, result.stderr)
++        row = self.rows()[0]
++        self.assertEqual(row['status'], 'failed')
++        self.assertIn('Commande échouée (3)', row['error'])
++        self.assertEqual(len(row['commands']), 1)  # ni contrat ni délégation après l'échec
++        self.assertFalse((self.project / '.workspace/calls').exists())
++        self.assertIs(row['arm_worktree_kept'], True)
++        self.assertTrue(Path(row['arm_worktree']).is_dir())
++        self.assertEqual(self.git('branch', '--show-current'), 'initial')
++
++    def test_invalid_setup_is_refused(self):
++        self.config['setup'] = ['sh', 7]
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 1)
++        self.assertIn('setup', result.stderr)
++        self.assertFalse((self.base / 'results.jsonl').exists())

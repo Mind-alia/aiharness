@@ -1,0 +1,575 @@
+diff --git a/template/scripts/lib/attack_bench.py b/template/scripts/lib/attack_bench.py
+--- a/template/scripts/lib/attack_bench.py
++++ b/template/scripts/lib/attack_bench.py
+@@ -12,9 +12,11 @@
+ import os
+ from pathlib import Path
+ import re
++import select
+ import shutil
+ import subprocess
+ import sys
++import time
+ from typing import Any, Callable, Dict, List, Optional, Tuple
+ 
+ sys.dont_write_bytecode = True
+@@ -24,6 +26,10 @@
+     sys.path.insert(0, str(LIB_DIR))
+ 
+ import bench_rule  # noqa: E402
++import events  # noqa: E402
++import orchestrator  # noqa: E402
++import procs  # noqa: E402
++import sandbox  # noqa: E402
+ 
+ try:
+     from safety import check_no_symlinks, write_file_secure
+@@ -256,6 +262,142 @@
+         check=check_fail_is_blocked,
+     ),
+ ]
++
++
++INTERRUPTION = Attack(
++    id='interruption',
++    category='Interruption',
++    description='Délégation tuée par SIGKILL : conteneur, issue et agent nettoyés',
++    command='',
++    check=check_fail_is_blocked,
++)
++EVIDENCE_DIR = '.workspace/run/delegate'
++READY_TIMEOUT = 20
++GROUP_TIMEOUT = 5
++POLL_INTERVAL = 0.05
++
++# Délégation factice : même ligne de commande que delegate.py (argv : delegate.py, racine, fiche).
++# Elle écrit un statut running, lance un agent gardé et dort jusqu'au SIGKILL.
++DELEGATE_STUB = """
++import datetime, json, os, subprocess, sys, time
++sys.path.insert(0, __LIB__)
++import events
++import procs
++root, task_file = sys.argv[2], sys.argv[3]
++task_id = os.path.basename(task_file)[:-len('.md')]
++evidence = os.path.join(root, '.workspace', 'run', 'delegate', task_id)
++os.makedirs(evidence, mode=0o700)
++status = {'id': task_id, 'agent': 'factice', 'outcome': 'running', 'attempts': 1,
++          'started_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
++fd = os.open(os.path.join(evidence, 'status.json'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++with os.fdopen(fd, 'w', encoding='utf-8') as stream:
++    json.dump(status, stream)
++events.record(root, task_id, 'attempt_started', {'attempt': 1, 'phase': 'attempt', 'resumed': False})
++agent = subprocess.Popen(['sleep', '300'], start_new_session=True)
++guardian = procs.start_guardian(agent.pid)
++print('ready %d' % agent.pid, flush=True)
++time.sleep(300)
++"""
++
++
++def _interruption(status: str, reason: str = '') -> AttackResult:
++    return AttackResult(attack=INTERRUPTION, status=status, reason=reason, returncode=0, output='')
++
++
++def _stop_container(root: Path, task_id: str, sandbox_sh: Path) -> None:
++    subprocess.run(['sh', str(sandbox_sh), 'stop', task_id], cwd=str(root),
++                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++def _launch_stub(root: Path, task_id: str) -> subprocess.Popen:
++    code = DELEGATE_STUB.replace('__LIB__', repr(str(LIB_DIR)))
++    task_file = root / '.workspace/tasks' / (task_id + '.md')
++    argv = [sys.executable, '-c', code, 'delegate.py', str(root), str(task_file)]
++    return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
++
++
++def _read_ready(delegate: subprocess.Popen) -> Optional[int]:
++    """Pid de l'agent annoncé par `ready <pid>` dans le délai ; `None` sinon."""
++    ready, _, _ = select.select([delegate.stdout], [], [], READY_TIMEOUT)
++    parts = delegate.stdout.readline().split() if ready else []
++    if len(parts) == 2 and parts[0] == 'ready' and parts[1].isdigit():
++        return int(parts[1])
++    return None
++
++
++def _container_listed(name: str) -> bool:
++    docker_bin = shutil.which('docker') or 'docker'
++    done = subprocess.run([docker_bin, 'ps', '-a', '--filter', 'name=' + name, '--format', '{{.Names}}'],
++                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
++    return name in done.stdout.splitlines()
++
++
++def _status_outcome(root: Path, task_id: str) -> Optional[str]:
++    try:
++        data = json.loads((root / EVIDENCE_DIR / task_id / 'status.json').read_text(encoding='utf-8'))
++    except (OSError, ValueError):
++        return None
++    return data.get('outcome') if isinstance(data, dict) else None
++
++
++def _interrupted_event(root: Path, task_id: str) -> bool:
++    return any(item['event'] == 'outcome' and (item.get('detail') or {}).get('outcome') == 'interrupted'
++               for item in events.read(root, task_id=task_id))
++
++
++def _group_alive_after_wait(pgid: int) -> bool:
++    deadline = time.monotonic() + GROUP_TIMEOUT
++    while procs.group_alive(pgid) and time.monotonic() < deadline:
++        time.sleep(POLL_INTERVAL)
++    return procs.group_alive(pgid)
++
++
++def _missed_checks(root: Path, task_id: str, name: str, agent_pid: int) -> List[str]:
++    checks = (
++        ('conteneur encore présent', _container_listed(name)),
++        ('issue non écrite', _status_outcome(root, task_id) != 'interrupted'),
++        ('événement absent', not _interrupted_event(root, task_id)),
++        ('agent encore en vie', _group_alive_after_wait(agent_pid)),
++    )
++    return [label for label, failed in checks if failed]
++
++
++def _cleanup(root: Path, task_id: str, sandbox_sh: Path, delegate: subprocess.Popen,
++             agent_pid: Optional[int]) -> None:
++    if delegate.poll() is None:
++        delegate.kill()
++        delegate.wait()
++    delegate.stdout.close()
++    if agent_pid is not None and procs.group_alive(agent_pid):
++        procs.kill_group(agent_pid)
++    _stop_container(root, task_id, sandbox_sh)
++
++
++def run_interruption_scenario(root: Path, task_id: str, sandbox_sh: Path) -> AttackResult:
++    """Tue une délégation factice par SIGKILL, répare, puis constate qu'il ne reste rien."""
++    name = sandbox.get_container_name(root, task_id)
++    start = subprocess.run(['sh', str(sandbox_sh), 'start', task_id], cwd=str(root),
++                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    if start.returncode != 0:
++        return _interruption('non testable', start.stderr.strip())
++    if os.path.lexists(root / EVIDENCE_DIR / task_id):
++        _stop_container(root, task_id, sandbox_sh)
++        return _interruption('non testable', 'dossier de preuves existant')
++    delegate = _launch_stub(root, task_id)
++    agent_pid = None
++    try:
++        agent_pid = _read_ready(delegate)
++        if agent_pid is None:
++            return _interruption('non testable', 'délégation factice sans ligne ready')
++        delegate.kill()
++        delegate.wait()
++        orchestrator.repair(root)
++        missed = _missed_checks(root, task_id, name, agent_pid)
++    finally:
++        _cleanup(root, task_id, sandbox_sh, delegate, agent_pid)
++    if missed:
++        return _interruption('FAILLE', 'constats manqués : ' + ', '.join(missed))
++    return _interruption('bloquée')
+ 
+ 
+ def check_docker_available() -> bool:
+@@ -585,6 +727,8 @@
+             stderr=subprocess.PIPE
+         )
+ 
++    results.append(run_interruption_scenario(root, task_id, sandbox_sh))
++
+     # Affichage du tableau texte
+     print_text_table(results)
+ 
+diff --git a/template/scripts/lib/orchestrator.py b/template/scripts/lib/orchestrator.py
+--- a/template/scripts/lib/orchestrator.py
++++ b/template/scripts/lib/orchestrator.py
+@@ -20,6 +20,8 @@
+ 
+ import events
+ import safety
++import sandbox
++import task_phase
+ 
+ sys.dont_write_bytecode = True
+ 
+@@ -34,11 +36,15 @@
+ CODEX_EXEC = re.compile(r'\bcodex(@[\w.-]+)?\s+exec\s')
+ COMMAND_LIMIT = 160
+ SUBPROCESS_TIMEOUT = 10
++REMOVE_TIMEOUT = 30
+ LAUNCHER_LIMIT = 64
++DELEGATE_RUN_DIR = '.workspace/run/delegate'
++DELEGATE_SCRIPT = 'delegate.py'
++REPAIR_FLAG = '--repair'
+ EXIT_HELD = 3
+ EXIT_USAGE = 64
+ USAGE = ('usage : orchestrator.sh claim [--session NOM] [--model NOM] [--repos CHEMIN[,CHEMIN...]] '
+-         '[--by NOM] [--pid N] [--force]\n        orchestrator.sh release\n        orchestrator.sh status')
++         '[--by NOM] [--pid N] [--force]\n        orchestrator.sh release\n        orchestrator.sh status [--repair]')
+ 
+ 
+ def _lock_path(root):
+@@ -295,13 +301,103 @@
+     return lines or ['processus : aucun']
+ 
+ 
+-def status(root, _args):
++def _orphan_lines(held):
++    """Avertissement quand le verrou lisible désigne un pid mort ; liste vide sinon."""
++    if held is None or _pid_alive(held.get('pid')):
++        return []
++    return ['verrou orphelin : pid %s mort ; libérable par bash scripts/orchestrator.sh release' % held.get('pid')]
++
++
++def status(root, args):
+     path = _lock_path(root)
+     held = _read_lock(path) if os.path.lexists(path) else None
+-    lines = [_lock_line(root)] + _task_lines(root, held) + _container_lines() + _process_lines()
++    lines = [_lock_line(root)] + _orphan_lines(held)
++    lines += _task_lines(root, held) + _container_lines() + _process_lines()
+     for line in lines:
+         print(line)
++    if args is not None and args.repair:
++        for line in repair(root):
++            print(line)
+     return 0
++
++
++def _process_snapshot():
++    """Couples (pid, commande), ou `None` si la liste des processus est illisible."""
++    try:
++        return _list_processes()
++    except (OSError, subprocess.SubprocessError):
++        return None
++
++
++def delegation_alive(task_id, processes=None):
++    """Vrai si un processus `delegate.py` vise la tâche, ou si la liste des processus est illisible (prudence)."""
++    if processes is None:
++        processes = _process_snapshot()
++    if processes is None:
++        return True
++    suffixes = ('/%s.md' % task_id, '/%s/task.md' % task_id)
++    return any(DELEGATE_SCRIPT in command and any(word.endswith(suffixes) for word in command.split())
++               for _pid, command in processes)
++
++
++def _container_removed(name):
++    """`True` si `docker rm -f` réussit, `False` s'il échoue, `None` si docker est absent ou muet."""
++    docker_bin = shutil.which('docker')
++    if not docker_bin:
++        return None
++    try:
++        done = subprocess.run([docker_bin, 'rm', '-f', name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                              stderr=subprocess.DEVNULL, timeout=REMOVE_TIMEOUT)
++    except (OSError, subprocess.SubprocessError):
++        return None
++    return done.returncode == 0
++
++
++def _container_phrase(name):
++    removed = _container_removed(name)
++    if removed is None:
++        return 'docker indisponible'
++    if removed:
++        return 'conteneur %s supprimé' % name
++    return 'conteneur %s non supprimé (absent ou refusé par docker)' % name
++
++
++def _interrupt(root, task_id, status_file, data):
++    """Marque une délégation morte comme interrompue, puis retire son conteneur ; renvoie la ligne d'état."""
++    ended_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
++    _write_atomic(status_file, dict(data, outcome='interrupted', ended_at=ended_at, interrupted_by='repair'))
++    events.record(root, task_id, 'outcome',
++                  {'outcome': 'interrupted', 'attempts': data.get('attempts'), 'by': 'repair'})
++    task_phase.set_phase(root, task_id, 'failed')
++    name = sandbox.get_container_name(root, task_id)
++    return 'réparé : délégation %s interrompue (processus mort), %s' % (task_id, _container_phrase(name))
++
++
++def _repair_one(root, folder):
++    """Ligne de réparation pour un dossier de délégation ; `None` s'il n'y a rien à faire."""
++    status_file = folder / 'status.json'
++    if not os.path.lexists(status_file):
++        return None
++    try:
++        safety.check_no_symlinks(status_file, root)
++    except ValueError:
++        return 'réparation refusée : %s (lien)' % folder.name
++    data = _read_lock(status_file)  # même lecture : un objet JSON, sinon None
++    if data is None or data.get('outcome') != 'running' or delegation_alive(folder.name):
++        return None
++    return _interrupt(root, folder.name, status_file, data)
++
++
++def repair(root):
++    """Répare les délégations dont le processus est mort alors que leur statut reste `running`."""
++    base = root / DELEGATE_RUN_DIR
++    lines = []
++    if base.is_dir():
++        for folder in sorted(base.iterdir()):
++            line = _repair_one(root, folder)
++            if line is not None:
++                lines.append(line)
++    return lines or ['réparation : rien à faire']
+ 
+ 
+ def _claim_parser():
+@@ -324,6 +420,8 @@
+     root, command, rest = Path(argv[1]), argv[2], argv[3:]
+     if command == 'claim':
+         args = _claim_parser().parse_args(rest)
++    elif command == 'status' and rest in ([], [REPAIR_FLAG]):
++        args = argparse.Namespace(repair=bool(rest))
+     elif rest:
+         print(USAGE, file=sys.stderr)
+         return EXIT_USAGE
+diff --git a/template/scripts/orchestrator.sh b/template/scripts/orchestrator.sh
+--- a/template/scripts/orchestrator.sh
++++ b/template/scripts/orchestrator.sh
+@@ -1,6 +1,6 @@
+ #!/bin/sh
+ # Usage: scripts/orchestrator.sh claim [--session NOM] [--model NOM] [--repos CHEMIN[,CHEMIN...]] [--pid N] [--force]
+-#        scripts/orchestrator.sh release | status
++#        scripts/orchestrator.sh release | status [--repair]
+ umask 077
+ set -eu
+ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+diff --git a/tests/test_attack_bench.py b/tests/test_attack_bench.py
+--- a/tests/test_attack_bench.py
++++ b/tests/test_attack_bench.py
+@@ -220,7 +220,7 @@
+         self.assertEqual(res.returncode, 0, f"Erreur : {res.stderr}\nStdout : {res.stdout}")
+ 
+         # Vérification du tableau texte et de la mention finale
+-        self.assertIn('Attaques bloquées : 18/18', res.stdout)
++        self.assertIn('Attaques bloquées : 19/19', res.stdout)
+         self.assertIn('write-etc', res.stdout)
+         self.assertIn('bloquée', res.stdout)
+         self.assertNotIn('FAILLE', res.stdout)
+@@ -229,8 +229,8 @@
+         metrics_file = self.root / '.workspace/metrics/attack-bench.json'
+         self.assertTrue(metrics_file.is_file())
+         data = json.loads(metrics_file.read_text(encoding='utf-8'))
+-        self.assertEqual(data['blocked'], 18)
+-        self.assertEqual(data['total'], 18)
++        self.assertEqual(data['blocked'], 19)
++        self.assertEqual(data['total'], 19)
+         self.assertEqual(data['failles'], [])
+         self.assertEqual(data['non_testables'], [])
+ 
+@@ -240,13 +240,13 @@
+         self.assertEqual(res.returncode, 1, f"Attendu code 1, reçu {res.returncode}")
+ 
+         self.assertIn('FAILLE', res.stdout)
+-        self.assertIn('Attaques bloquées : 17/18', res.stdout)
++        self.assertIn('Attaques bloquées : 18/19', res.stdout)
+ 
+         metrics_file = self.root / '.workspace/metrics/attack-bench.json'
+         self.assertTrue(metrics_file.is_file())
+         data = json.loads(metrics_file.read_text(encoding='utf-8'))
+-        self.assertEqual(data['blocked'], 17)
+-        self.assertEqual(data['total'], 18)
++        self.assertEqual(data['blocked'], 18)
++        self.assertEqual(data['total'], 19)
+         self.assertEqual(data['failles'], ['write-etc'])
+ 
+     def test_network_tool_missing_marks_non_testable(self):
+@@ -257,13 +257,13 @@
+ 
+         self.assertIn('non testable', res.stdout)
+         self.assertIn('aucun outil réseau disponible', res.stdout)
+-        self.assertIn('Attaques bloquées : 17/18', res.stdout)
++        self.assertIn('Attaques bloquées : 18/19', res.stdout)
+ 
+         metrics_file = self.root / '.workspace/metrics/attack-bench.json'
+         self.assertTrue(metrics_file.is_file())
+         data = json.loads(metrics_file.read_text(encoding='utf-8'))
+-        self.assertEqual(data['blocked'], 17)
+-        self.assertEqual(data['total'], 18)
++        self.assertEqual(data['blocked'], 18)
++        self.assertEqual(data['total'], 19)
+         self.assertEqual(data['failles'], [])
+         self.assertIn('net-outbound', data['non_testables'])
+ 
+@@ -355,6 +355,42 @@
+         # 3. Identifiant invalide
+         res3 = self.run_bench('Tache_Invalide!')
+         self.assertEqual(res3.returncode, 64)
++
++    def load_bench_module(self):
++        spec = importlib.util.spec_from_file_location('attack_bench_scenario', ROOT / 'template/scripts/lib/attack_bench.py')
++        module = importlib.util.module_from_spec(spec)
++        sys.modules[spec.name] = module
++        self.addCleanup(sys.modules.pop, spec.name, None)
++        spec.loader.exec_module(module)
++        return module
++
++    def test_interruption_scenario_kills_the_delegation_and_leaves_nothing(self):
++        task_id = self.prepare_task('task-interrupt', profile='python')
++        bench = self.load_bench_module()
++        with patch.dict(os.environ, self.env, clear=True):
++            result = bench.run_interruption_scenario(self.root, task_id, self.scripts_dir / 'sandbox.sh')
++        self.assertEqual((result.attack.id, result.attack.category, result.status, result.reason),
++                         ('interruption', 'Interruption', 'bloquée', ''))
++        status_file = self.root / '.workspace/run/delegate' / task_id / 'status.json'
++        self.assertEqual(json.loads(status_file.read_text(encoding='utf-8'))['outcome'], 'interrupted')
++        events_file = self.root / '.workspace/events.jsonl'
++        outcomes = [json.loads(line) for line in events_file.read_text(encoding='utf-8').splitlines()
++                    if json.loads(line)['event'] == 'outcome']
++        self.assertEqual([(item['task_id'], item['detail']['outcome'], item['detail']['by']) for item in outcomes],
++                         [(task_id, 'interrupted', 'repair')])
++        self.assertTrue(any(call[:2] == ['rm', '-f'] for call in self.get_docker_calls()))
++
++    def test_existing_evidence_folder_is_never_overwritten(self):
++        task_id = self.prepare_task('task-evidence', profile='python')
++        evidence = self.root / '.workspace/run/delegate' / task_id
++        evidence.mkdir(parents=True)
++        (evidence / 'precieux.txt').write_text('preuve\n', encoding='utf-8')
++        bench = self.load_bench_module()
++        with patch.dict(os.environ, self.env, clear=True):
++            result = bench.run_interruption_scenario(self.root, task_id, self.scripts_dir / 'sandbox.sh')
++        self.assertEqual((result.status, result.reason), ('non testable', 'dossier de preuves existant'))
++        self.assertEqual([path.name for path in evidence.iterdir()], ['precieux.txt'])
++        self.assertTrue(any(call[:1] == ['rm'] for call in self.get_docker_calls()))
+ 
+ 
+ class RecordLastBenchTests(unittest.TestCase):
+diff --git a/tests/test_orchestrator.py b/tests/test_orchestrator.py
+--- a/tests/test_orchestrator.py
++++ b/tests/test_orchestrator.py
+@@ -13,6 +13,7 @@
+ BASH = shutil.which('bash')
+ sys.path.insert(0, str(ROOT / 'template/scripts/lib'))
+ import orchestrator  # noqa: E402
++import sandbox  # noqa: E402
+ 
+ 
+ def run(root, env, *args):
+@@ -332,6 +333,130 @@
+         self.assertTrue(any(line.startswith('processus : %d ' % child.pid) and 'campaign.py' in line
+                             for line in lines), lines)
+ 
++    def test_status_flags_an_orphan_lock_and_release_clears_it(self):
++        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
++        dead.wait()
++        run(self.root, self.env, 'claim', '--session', 's', '--pid', str(dead.pid))
++        self.assertEqual(self.status_lines()[1], 'verrou orphelin : pid %d mort ; libérable par bash scripts/'
++                         'orchestrator.sh release' % dead.pid)
++        self.assertEqual(run(self.root, self.env, 'release').returncode, 0)
++        self.assertEqual(self.status_lines()[0], 'verrou : aucun')
++
++    def test_no_orphan_line_for_a_live_pid_an_absent_or_an_unreadable_lock(self):
++        run(self.root, self.env, 'claim', '--session', 's', '--pid', str(os.getpid()))
++        self.assertFalse([line for line in self.status_lines() if 'orphelin' in line])
++        self.lock.write_text('pas du json')
++        self.assertFalse([line for line in self.status_lines() if 'orphelin' in line])
++        self.lock.unlink()
++        self.assertFalse([line for line in self.status_lines() if 'orphelin' in line])
++
++    def test_delegation_alive_matches_only_the_task_file_of_a_delegate(self):
++        listed = [(1, 'python3 delegate.py /r/.workspace/tasks/t-a.md')]
++        self.assertTrue(orchestrator.delegation_alive('t-a', listed))
++        self.assertTrue(orchestrator.delegation_alive('t-a', [(3, 'python3 delegate.py /r/.workspace/tasks/t-a/task.md')]))
++        self.assertFalse(orchestrator.delegation_alive('t-b', listed))
++        self.assertFalse(orchestrator.delegation_alive('t-a', [(2, 'vim /r/.workspace/tasks/t-a.md')]))
++        self.assertFalse(orchestrator.delegation_alive('t-a', [(4, 'python3 delegate.py /r/.workspace/tasks/t-ab.md')]))
++        self.assertFalse(orchestrator.delegation_alive('t-a', []))
++
++    def test_delegation_alive_is_true_when_the_process_list_is_unreadable(self):
++        with mock.patch.object(orchestrator, '_list_processes', side_effect=OSError('ps absent')):
++            self.assertTrue(orchestrator.delegation_alive('t-a'))
++
++    def write_delegation(self, task_id, outcome='running', text=None):
++        folder = self.root / '.workspace/run/delegate' / task_id
++        folder.mkdir(parents=True, exist_ok=True)
++        content = text or json.dumps({'id': task_id, 'agent': 'factice', 'outcome': outcome, 'attempts': 2,
++                                      'started_at': '2026-10-19T08:00:00Z'})
++        (folder / 'status.json').write_text(content, encoding='utf-8')
++        return folder / 'status.json'
++
++    def repair_with(self, listed, path_dir):
++        with mock.patch.object(orchestrator, '_list_processes', return_value=listed), \
++                mock.patch.dict(os.environ, {'PATH': str(path_dir)}):
++            return orchestrator.repair(self.root)
++
++    def test_repair_interrupts_a_dead_delegation_once(self):
++        status_file = self.write_delegation('t-mort')
++        state_file = self.root / '.workspace/orchestration/tasks/t-mort/state.json'
++        state_file.parent.mkdir(parents=True)
++        state_file.write_text(json.dumps({'status': 'running', 'phase': 'attempt 2'}), encoding='utf-8')
++        log = self.bin.parent / 'docker.log'
++        self.fake_docker('echo "$@" >> "%s"' % log)
++        name = sandbox.get_container_name(self.root, 't-mort')
++
++        first = self.repair_with([], self.bin)
++        after_first = self.events()
++        second = self.repair_with([], self.bin)
++
++        self.assertEqual(first, ['réparé : délégation t-mort interrompue (processus mort), conteneur %s supprimé' % name])
++        self.assertEqual(second, ['réparation : rien à faire'])
++        data = json.loads(status_file.read_text(encoding='utf-8'))
++        self.assertEqual((data['outcome'], data['interrupted_by'], data['attempts'], data['agent']),
++                         ('interrupted', 'repair', 2, 'factice'))
++        self.assertRegex(data['ended_at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
++        self.assertEqual(stat.S_IMODE(status_file.stat().st_mode), 0o600)
++        self.assertEqual(self.events(), after_first)
++        self.assertEqual([(item['task_id'], item['event'], item['detail']) for item in after_first],
++                         [('t-mort', 'outcome', {'outcome': 'interrupted', 'attempts': 2, 'by': 'repair'})])
++        self.assertEqual(json.loads(state_file.read_text(encoding='utf-8'))['phase'], 'failed')
++        self.assertEqual(log.read_text(encoding='utf-8').splitlines(), ['rm -f %s' % name])
++
++    def test_repair_leaves_a_live_delegation_alone(self):
++        status_file = self.write_delegation('t-vivant')
++        before = status_file.read_text(encoding='utf-8')
++        listed = [(4242, 'python3 delegate.py %s/.workspace/tasks/t-vivant.md' % self.root)]
++        self.assertEqual(self.repair_with(listed, self.bin), ['réparation : rien à faire'])
++        self.assertEqual(status_file.read_text(encoding='utf-8'), before)
++        self.assertEqual(self.events(), [])
++
++    def test_repair_ignores_finished_unreadable_and_non_object_statuses(self):
++        paths = [self.write_delegation('t-fini', outcome='done'), self.write_delegation('t-casse', text='{oups'),
++                 self.write_delegation('t-liste', text='[1, 2]')]
++        before = [path.read_text(encoding='utf-8') for path in paths]
++        self.assertEqual(self.repair_with([], self.bin), ['réparation : rien à faire'])
++        self.assertEqual([path.read_text(encoding='utf-8') for path in paths], before)
++        self.assertEqual(self.events(), [])
++
++    def test_repair_says_docker_is_unavailable_when_docker_is_absent(self):
++        status_file = self.write_delegation('t-sans-docker')
++        empty = self.bin.parent / 'vide'
++        empty.mkdir()
++        self.assertEqual(self.repair_with([], empty),
++                         ['réparé : délégation t-sans-docker interrompue (processus mort), docker indisponible'])
++        self.assertEqual(json.loads(status_file.read_text(encoding='utf-8'))['outcome'], 'interrupted')
++
++    def test_repair_refuses_a_symlinked_status_and_repairs_the_others(self):
++        outside = self.root.parent / 'dehors.json'
++        outside.write_text(json.dumps({'outcome': 'running'}), encoding='utf-8')
++        folder = self.root / '.workspace/run/delegate/t-lien'
++        folder.mkdir(parents=True)
++        (folder / 'status.json').symlink_to(outside)
++        self.write_delegation('t-ok')
++        lines = self.repair_with([], self.bin)
++        self.assertEqual(lines[0], 'réparation refusée : t-lien (lien)')
++        self.assertTrue(lines[1].startswith('réparé : délégation t-ok interrompue'), lines)
++        self.assertEqual(json.loads(outside.read_text(encoding='utf-8')), {'outcome': 'running'})
++
++    def test_status_repair_prints_the_status_then_the_repair_lines(self):
++        self.write_delegation('t-cli')
++        listing = self.bin.parent / 'ps.txt'
++        listing.write_text('  7 vim notes.md\n')
++        self.fake_ps(listing)
++        name = sandbox.get_container_name(self.root, 't-cli')
++        done = run(self.root, self.env, 'status', '--repair')
++        self.assertEqual(done.returncode, 0, done.stderr)
++        lines = done.stdout.splitlines()
++        self.assertEqual(lines[0], 'verrou : aucun')
++        self.assertEqual(lines[-1], 'réparé : délégation t-cli interrompue (processus mort), conteneur %s supprimé'
++                         % name)
++
++    def test_status_accepts_only_the_repair_option(self):
++        done = run(self.root, self.env, 'status', '--force')
++        self.assertEqual(done.returncode, 64)
++        self.assertIn('status [--repair]', done.stderr)
++        self.assertFalse(self.lock.exists())
++
+     def test_usage(self):
+         for args in ([], ['inconnue'], ['status', 'extra']):
+             done = run(self.root, self.env, *args)

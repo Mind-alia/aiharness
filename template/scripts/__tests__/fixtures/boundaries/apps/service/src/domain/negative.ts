@@ -1,0 +1,10 @@
+import "node:fs";
+import "node:http";
+import "fastify";
+import "../../adapters/store/memory/memory-event-store.js";
+import "fs/promises";
+import "node:child_process";
+import "pino";
+import "@fastify/cookie";
+import "../http/routes.js";
+import "../composition/start.js";

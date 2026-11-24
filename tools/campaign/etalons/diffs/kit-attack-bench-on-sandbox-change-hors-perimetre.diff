@@ -1,0 +1,527 @@
+diff --git a/template/scripts/gate.sh b/template/scripts/gate.sh
+--- a/template/scripts/gate.sh
++++ b/template/scripts/gate.sh
+@@ -90,9 +90,19 @@
+ if not quick or profile == 'docs':
+     checks.append(('docs', ['/bin/sh', 'scripts/docs-check.sh']))
+ checks.insert(0, ('secrets', ['/bin/sh', 'scripts/check-secret-tracing.sh']))
++if (root / 'scripts/lib/bench_rule.py').is_file():
++    # Import à l'intérieur de ce test : une copie sans bench_rule ne doit rien importer.
++    import bench_rule
++    if bench_rule.applies(root):
++        checks.insert(1, ('attack_bench', None))
+ failed = 0
+ for name, command in checks:
+-    if not configured(command):
++    if command is None:
++        ok, message = bench_rule.check(root)
++        if message:
++            print(message, file=sys.stderr)
++        value, code = ok, int(not ok)
++    elif not configured(command):
+         value = 'non_configure'
+         code = 2
+     else:
+diff --git a/template/scripts/lib/attack_bench.py b/template/scripts/lib/attack_bench.py
+--- a/template/scripts/lib/attack_bench.py
++++ b/template/scripts/lib/attack_bench.py
+@@ -23,8 +23,10 @@
+ if str(LIB_DIR) not in sys.path:
+     sys.path.insert(0, str(LIB_DIR))
+ 
++import bench_rule  # noqa: E402
++
+ try:
+-    from safety import check_no_symlinks
++    from safety import check_no_symlinks, write_file_secure
+     from secrets import known_values, mask_secrets
+ except ImportError:
+     def known_values(project_root: Path) -> List[str]:
+@@ -478,6 +480,46 @@
+     return metrics_file
+ 
+ 
++def current_commit(root: Path) -> Optional[str]:
++    try:
++        res = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=str(root),
++                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    except OSError:
++        return None
++    commit = res.stdout.strip()
++    return commit if res.returncode == 0 and commit else None
++
++
++def record_last_bench(
++    root: Path,
++    blocked: int,
++    total: int,
++    failles: List[str],
++    now_iso: str
++) -> Path:
++    security_dir = root / '.workspace' / 'security'
++    check_no_symlinks(security_dir, root)
++    security_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
++    security_dir.chmod(0o700)
++    check_no_symlinks(security_dir, root)
++
++    record_file = root / bench_rule.RECORD
++    check_no_symlinks(record_file, root)
++
++    payload = {
++        "commit": current_commit(root),
++        "date": now_iso,
++        "score": f"{blocked}/{total}",
++        "blocked": blocked,
++        "total": total,
++        "failles": failles,
++        "green": not failles
++    }
++
++    write_file_secure(record_file, json.dumps(payload, indent=2, ensure_ascii=False))
++    return record_file
++
++
+ def parse_args(argv: List[str]) -> Tuple[Path, str, bool]:
+     if not argv:
+         print("Usage : attack-bench.sh <task-id> [--markdown]", file=sys.stderr)
+@@ -554,6 +596,15 @@
+     # Enregistrement des métriques JSON
+     save_metrics_json(root, image, results, now_iso)
+ 
++    # Enregistrement du dernier passage, lu par la porte (bench_rule)
++    record_last_bench(
++        root,
++        sum(1 for r in results if r.status == 'bloquée'),
++        len(results),
++        [r.attack.id for r in results if r.status == 'FAILLE'],
++        now_iso
++    )
++
+     # Rapport Markdown si demandé
+     if markdown:
+         save_markdown_report(root, task_id, image, results, date_str)
+diff --git a/template/scripts/lib/bench_rule.py b/template/scripts/lib/bench_rule.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/bench_rule.py
+@@ -0,0 +1,100 @@
++"""Règle de la porte : le banc d'attaque doit être vert après tout changement du bac à sable.
++
++Le banc (attack_bench.py) enregistre son dernier passage dans RECORD. La porte refuse si le
++bac à sable a changé depuis ce passage, si ce passage était rouge, ou s'il n'y en a aucun.
++Python 3.9, bibliothèque standard seule.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++from typing import List, Optional, Tuple
++
++sys.dont_write_bytecode = True
++
++LIB_DIR = Path(__file__).resolve().parent
++if str(LIB_DIR) not in sys.path:
++    sys.path.insert(0, str(LIB_DIR))
++
++from safety import check_no_symlinks  # noqa: E402
++
++RECORD = '.workspace/security/last-attack-bench.json'
++WATCHED = ('template/scripts/lib/sandbox.py', 'template/scripts/run-in-sandbox.sh', 'template/docker')
++DOCKER_DIR = 'template/docker'
++SHORT_COMMIT_LENGTH = 7
++
++
++def applies(root: Path) -> bool:
++    """Règle 1 : la porte ne s'applique que si un chemin surveillé existe (template/docker en dossier)."""
++    return (
++        (root / WATCHED[0]).exists()
++        or (root / WATCHED[1]).exists()
++        or (root / DOCKER_DIR).is_dir()
++    )
++
++
++def check(root: Path) -> Tuple[bool, str]:
++    """Retourne (ok, message) ; le message est vide si ok, sinon une seule ligne."""
++    record, reason = _read_record(root)
++    if record is None:
++        return False, _refusal(reason)
++    if record.get('green') is not True:
++        return False, _refusal('dernier banc rouge')
++    commit = record['commit']
++    if _git(root, 'cat-file', '-e', commit + '^{commit}') is None:
++        return False, _refusal(f'commit du banc introuvable : {commit}')
++    changed = _changed_since(root, commit)
++    if changed is None:
++        return False, _refusal('git indisponible')
++    if changed:
++        short = commit[:SHORT_COMMIT_LENGTH]
++        return False, _refusal(f"modifié depuis le banc {short} : {', '.join(changed)}")
++    return True, ''
++
++
++def _refusal(reason: str) -> str:
++    return f"banc d'attaque requis : {reason} ; lancer bash scripts/attack-bench.sh <tâche préparée>"
++
++
++def _read_record(root: Path) -> Tuple[Optional[dict], str]:
++    """Lit l'enregistrement ; retourne (contenu, '') ou (None, raison)."""
++    record = root / RECORD
++    if not os.path.lexists(record):
++        return None, 'aucun banc enregistré'
++    try:
++        check_no_symlinks(record, root)
++        if not record.is_file():
++            return None, 'enregistrement illisible'
++        data = json.loads(record.read_text(encoding='utf-8'))
++    except (OSError, ValueError):
++        return None, 'enregistrement illisible'
++    if not isinstance(data, dict) or not _valid_commit(data.get('commit')):
++        return None, 'enregistrement illisible'
++    return data, ''
++
++
++def _valid_commit(commit: object) -> bool:
++    # Un identifiant qui commence par '-' serait lu comme une option de git.
++    return isinstance(commit, str) and bool(commit.strip()) and not commit.startswith('-')
++
++
++def _changed_since(root: Path, commit: str) -> Optional[List[str]]:
++    """Fichiers surveillés changés depuis le commit, suivis ou non ; None si git échoue."""
++    tracked = _git(root, 'diff', '--name-only', commit, '--', *WATCHED)
++    untracked = _git(root, 'ls-files', '--others', '--exclude-standard', '--', *WATCHED)
++    if tracked is None or untracked is None:
++        return None
++    return sorted(set(tracked.splitlines()) | set(untracked.splitlines()))
++
++
++def _git(root: Path, *args: str) -> Optional[str]:
++    """Sortie standard de git, ou None si la commande échoue."""
++    try:
++        res = subprocess.run(['git', *args], cwd=str(root), stdout=subprocess.PIPE,
++                             stderr=subprocess.PIPE, text=True)
++    except OSError:
++        return None
++    return res.stdout if res.returncode == 0 else None
+diff --git a/tests/test_attack_bench.py b/tests/test_attack_bench.py
+--- a/tests/test_attack_bench.py
++++ b/tests/test_attack_bench.py
+@@ -357,5 +357,102 @@
+         self.assertEqual(res3.returncode, 64)
+ 
+ 
++class RecordLastBenchTests(unittest.TestCase):
++    NOW = '2026-10-19T08:00:00+00:00'
++
++    @classmethod
++    def setUpClass(cls):
++        spec = importlib.util.spec_from_file_location('attack_bench_record', ROOT / 'template/scripts/lib/attack_bench.py')
++        cls.module = importlib.util.module_from_spec(spec)
++        sys.modules[spec.name] = cls.module
++        cls.addClassCleanup(sys.modules.pop, spec.name, None)
++        spec.loader.exec_module(cls.module)
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name).resolve() / 'projet'
++        self.root.mkdir()
++        self.record = self.root / '.workspace/security/last-attack-bench.json'
++
++    def record_bench(self, failles=(), commit='abc1234'):
++        with patch.object(self.module, 'current_commit', return_value=commit):
++            return self.module.record_last_bench(self.root, 19 - len(failles), 19, list(failles), self.NOW)
++
++    def test_green_pass_writes_the_full_record(self):
++        returned = self.record_bench(commit='abc1234')
++        self.assertEqual(returned, self.record)
++        self.assertEqual(json.loads(self.record.read_text(encoding='utf-8')), {
++            'commit': 'abc1234',
++            'date': self.NOW,
++            'score': '19/19',
++            'blocked': 19,
++            'total': 19,
++            'failles': [],
++            'green': True,
++        })
++
++    def test_record_is_indented_with_a_final_newline(self):
++        self.record_bench()
++        text = self.record.read_text(encoding='utf-8')
++        self.assertTrue(text.endswith('}\n'))
++        self.assertIn('\n  "commit": "abc1234",\n', text)
++
++    def test_red_pass_lists_the_failures(self):
++        self.record_bench(failles=['write-etc', 'net-outbound'])
++        payload = json.loads(self.record.read_text(encoding='utf-8'))
++        self.assertFalse(payload['green'])
++        self.assertEqual(payload['failles'], ['write-etc', 'net-outbound'])
++        self.assertEqual(payload['score'], '17/19')
++
++    def test_each_pass_replaces_the_previous_record(self):
++        self.record_bench(failles=['write-etc'])
++        self.record_bench()
++        payload = json.loads(self.record.read_text(encoding='utf-8'))
++        self.assertTrue(payload['green'])
++        self.assertEqual(payload['failles'], [])
++
++    def test_commit_is_null_when_git_is_unavailable(self):
++        self.record_bench(commit=None)
++        self.assertIsNone(json.loads(self.record.read_text(encoding='utf-8'))['commit'])
++
++    def test_record_and_directory_permissions(self):
++        self.record_bench()
++        self.assertEqual(self.record.stat().st_mode & 0o777, 0o600)
++        self.assertEqual(self.record.parent.stat().st_mode & 0o777, 0o700)
++
++    def test_symlinked_record_is_refused_and_target_untouched(self):
++        target = self.root / 'cible.json'
++        target.write_text('intact\n', encoding='utf-8')
++        self.record.parent.mkdir(parents=True)
++        self.record.symlink_to(target)
++        with self.assertRaises(ValueError):
++            self.record_bench()
++        self.assertEqual(target.read_text(encoding='utf-8'), 'intact\n')
++
++    def test_symlinked_security_directory_is_refused(self):
++        outside = Path(self.temp.name).resolve() / 'dehors'
++        outside.mkdir()
++        (self.root / '.workspace').mkdir()
++        (self.root / '.workspace/security').symlink_to(outside)
++        with self.assertRaises(ValueError):
++            self.record_bench()
++        self.assertFalse((outside / 'last-attack-bench.json').exists())
++
++    def test_current_commit_is_the_head_of_a_git_repository(self):
++        env = dict(os.environ, GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid',
++                   GIT_COMMITTER_NAME='Test', GIT_COMMITTER_EMAIL='test@example.invalid')
++        subprocess.run(['git', 'init', '-q'], cwd=self.root, check=True)
++        (self.root / 'README.md').write_text('# Projet\n', encoding='utf-8')
++        subprocess.run(['git', 'add', '-A'], cwd=self.root, check=True)
++        subprocess.run(['git', 'commit', '-q', '-m', 'initial'], cwd=self.root, env=env, check=True)
++        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=self.root,
++                              stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
++        self.assertEqual(self.module.current_commit(self.root), head)
++
++    def test_current_commit_is_none_outside_a_git_repository(self):
++        self.assertIsNone(self.module.current_commit(self.root))
++
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tests/test_bench_rule.py b/tests/test_bench_rule.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_bench_rule.py
+@@ -0,0 +1,203 @@
++"""Tests de template/scripts/lib/bench_rule.py : la porte exige un banc d'attaque vert et à jour."""
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++
++LIB = Path(__file__).resolve().parents[1] / 'template/scripts/lib'
++sys.path.insert(0, str(LIB))
++
++import bench_rule  # noqa: E402
++
++SANDBOX = 'template/scripts/lib/sandbox.py'
++RUN_IN_SANDBOX = 'template/scripts/run-in-sandbox.sh'
++DOCKER_FILE = 'template/docker/python-git.Dockerfile'
++GIT_IDENTITY = {
++    'GIT_AUTHOR_NAME': 'Test',
++    'GIT_AUTHOR_EMAIL': 'test@example.invalid',
++    'GIT_COMMITTER_NAME': 'Test',
++    'GIT_COMMITTER_EMAIL': 'test@example.invalid',
++}
++
++
++class BenchRuleTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name).resolve() / 'project with spaces'
++        self.root.mkdir()
++        self.env = dict(os.environ, **GIT_IDENTITY)
++        self.git('init', '-q')
++        self.write(SANDBOX, 'SANDBOX = 1\n')
++        self.write(RUN_IN_SANDBOX, '#!/bin/sh\n')
++        self.write('README.md', '# Projet\n')
++        self.commit_all('initial')
++
++    def git(self, *args):
++        return subprocess.run(['git', *args], cwd=str(self.root), env=self.env,
++                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                              text=True, check=True).stdout.strip()
++
++    def commit_all(self, message):
++        self.git('add', '-A')
++        self.git('commit', '-q', '-m', message)
++
++    def head(self):
++        return self.git('rev-parse', 'HEAD')
++
++    def write(self, relative, content):
++        path = self.root / relative
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content, encoding='utf-8')
++        return path
++
++    def write_record(self, **fields):
++        payload = {'commit': self.head(), 'green': True, 'failles': []}
++        payload.update(fields)
++        self.write(bench_rule.RECORD, json.dumps(payload) + '\n')
++
++    def refusal(self, reason):
++        return f"banc d'attaque requis : {reason} ; lancer bash scripts/attack-bench.sh <tâche préparée>"
++
++    def test_applies_only_when_a_watched_path_exists(self):
++        self.assertFalse(bench_rule.applies(self.root / 'absent'))
++        self.assertTrue(bench_rule.applies(self.root))
++
++    def test_applies_is_false_when_no_watched_path_is_on_disk(self):
++        for relative in (SANDBOX, RUN_IN_SANDBOX):
++            (self.root / relative).unlink()
++        shutil.rmtree(self.root / 'template/scripts')
++        self.assertFalse(bench_rule.applies(self.root))
++
++    def test_applies_requires_template_docker_to_be_a_directory(self):
++        for relative in (SANDBOX, RUN_IN_SANDBOX):
++            (self.root / relative).unlink()
++        self.write('template/docker', 'pas un dossier\n')
++        self.assertFalse(bench_rule.applies(self.root))
++        (self.root / 'template/docker').unlink()
++        self.write(DOCKER_FILE, 'FROM scratch\n')
++        self.assertTrue(bench_rule.applies(self.root))
++
++    def test_missing_record_is_red(self):
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal('aucun banc enregistré'))
++
++    def test_record_symlink_is_unreadable(self):
++        target = self.write('elsewhere.json', json.dumps({'commit': self.head(), 'green': True}))
++        record = self.root / bench_rule.RECORD
++        record.parent.mkdir(parents=True)
++        record.symlink_to(target)
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal('enregistrement illisible'))
++
++    def test_dangling_record_symlink_is_unreadable(self):
++        record = self.root / bench_rule.RECORD
++        record.parent.mkdir(parents=True)
++        record.symlink_to(self.root / 'absent.json')
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal('enregistrement illisible'))
++
++    def test_invalid_json_is_unreadable(self):
++        self.write(bench_rule.RECORD, '{pas du json')
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal('enregistrement illisible'))
++
++    def test_record_that_is_not_an_object_is_unreadable(self):
++        self.write(bench_rule.RECORD, '["commit"]\n')
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal('enregistrement illisible'))
++
++    def test_record_without_commit_is_unreadable(self):
++        for commit in (None, '', '   ', 42, '--output=/tmp/x'):
++            with self.subTest(commit=commit):
++                self.write_record(commit=commit)
++                ok, message = bench_rule.check(self.root)
++                self.assertFalse(ok)
++                self.assertEqual(message, self.refusal('enregistrement illisible'))
++
++    def test_red_record_is_red(self):
++        self.write_record(green=False, failles=['write-etc'])
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal('dernier banc rouge'))
++
++    def test_green_must_be_true_not_merely_truthy(self):
++        self.write_record(green=1)
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal('dernier banc rouge'))
++
++    def test_green_record_on_current_commit_is_green(self):
++        self.write_record()
++        self.assertEqual(bench_rule.check(self.root), (True, ''))
++
++    def test_unwatched_change_keeps_the_rule_green(self):
++        self.write_record()
++        self.write('README.md', '# Projet modifié\n')
++        self.write('src/app.py', 'print("nouveau")\n')
++        self.assertEqual(bench_rule.check(self.root), (True, ''))
++
++    def test_uncommitted_sandbox_change_is_red_and_named(self):
++        self.write_record()
++        self.write(SANDBOX, 'SANDBOX = 2\n')
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal(f'modifié depuis le banc {self.head()[:7]} : {SANDBOX}'))
++
++    def test_change_committed_after_the_bench_is_red(self):
++        bench_commit = self.head()
++        self.write_record(commit=bench_commit)
++        self.write(SANDBOX, 'SANDBOX = 2\n')
++        self.commit_all('sandbox')
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal(f'modifié depuis le banc {bench_commit[:7]} : {SANDBOX}'))
++
++    def test_untracked_file_under_docker_is_red_and_named(self):
++        self.write_record()
++        self.write(DOCKER_FILE, 'FROM scratch\n')
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertIn(f': {DOCKER_FILE}', message)
++
++    def test_every_changed_watched_file_is_listed_sorted_and_comma_separated(self):
++        self.write_record()
++        self.write(RUN_IN_SANDBOX, '#!/bin/sh\necho modifié\n')
++        self.write(SANDBOX, 'SANDBOX = 3\n')
++        self.write(DOCKER_FILE, 'FROM scratch\n')
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        listed = ', '.join(sorted([DOCKER_FILE, RUN_IN_SANDBOX, SANDBOX]))
++        self.assertEqual(message, self.refusal(f'modifié depuis le banc {self.head()[:7]} : {listed}'))
++
++    def test_unknown_commit_is_red(self):
++        self.write_record(commit='0' * 40)
++        ok, message = bench_rule.check(self.root)
++        self.assertFalse(ok)
++        self.assertEqual(message, self.refusal(f'commit du banc introuvable : {"0" * 40}'))
++
++    def test_outside_a_git_repository_is_red(self):
++        plain = Path(self.temp.name).resolve() / 'hors depot'
++        plain.mkdir()
++        record = plain / bench_rule.RECORD
++        record.parent.mkdir(parents=True)
++        record.write_text(json.dumps({'commit': self.head(), 'green': True}), encoding='utf-8')
++        (plain / SANDBOX).parent.mkdir(parents=True)
++        (plain / SANDBOX).write_text('SANDBOX = 1\n', encoding='utf-8')
++        ok, message = bench_rule.check(plain)
++        self.assertFalse(ok)
++        self.assertIn('commit du banc introuvable', message)
++        self.assertNotIn('\n', message)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

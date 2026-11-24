@@ -1,0 +1,23 @@
+diff --git a/docs/LOT-2-plan.md b/docs/LOT-2-plan.md
+--- a/docs/LOT-2-plan.md
++++ b/docs/LOT-2-plan.md
+@@ -1,6 +1,8 @@
+ # Lot 2 — environnements par tâche, branches, superviseur indépendant et reprise sur quota
+ 
+ État : **S1 et S2 validées (17 octobre 2026, 182 tests du kit au vert, essai réel Codex + Docker réussi)** ; S3 (niveau totalement isolé) et phases 3 à 5 à faire. Historique : arrêt préventif Codex à 7 % de quota restant, puis reprise et corrections (voir la dernière section). Plan de cadrage et de réalisation rédigé le 16 octobre 2026. Autorisation d'exécution accordée par le propriétaire ; méthode Antigravity privilégiée pour préserver Codex, avec arrêt propre avant épuisement des ressources ou quotas. Dépôt ciblé : kit `~/workspace-ia` (kit racine, ni `console/` ni `template/` en tant que projets autonomes). Aucun commit, aucun push, aucune altération des branches réelles. Les anomalies E13 épinglées demeurent indépendantes de la première tranche S1.
++
++Mise à jour du 18 octobre 2026 : l'en-tête fait foi, le tableau de la section 1 a été mis à jour et le bilan de clôture plus bas décrit l'état du 16 octobre, avant les corrections.
+ 
+ ---
+ 
+@@ -8,8 +10,8 @@
+ 
+ | Composant / Fonctionnalité | Statut | Détails, limites et critères |
+ |---|---|---|
+-| **Tranche S1 — Préparation sûre d'espace de tâche (`task-workspace.sh`)** | **Code livré, non validé** (voir bilan de clôture) | Création de branche `workspace-task/<id>`, worktree privé `.workspace/worktrees/<id>`, état durable `.workspace/orchestration/tasks/<id>/state.json`, réservation conservative des périmètres. Aucune mutation Git avant validation complète. |
+-| **Conteneurs de travail et tests (S2)** | **Prévue / Non qualifiée** | Isolation par conteneur Linux ; non qualifiée sur les profils Node/Python du kit. Le worktree lié ne doit jamais être monté avec son `.git` accessible. |
++| **Tranche S1 — Préparation sûre d'espace de tâche (`task-workspace.sh`)** | **Validée le 17 octobre 2026** | Création de branche `workspace-task/<id>`, worktree privé `.workspace/worktrees/<id>`, état durable `.workspace/orchestration/tasks/<id>/state.json`, réservation conservative des périmètres. Aucune mutation Git avant validation complète. |
++| **Conteneurs de travail et tests (S2)** | **Validée le 17 octobre 2026** | Isolation par conteneur Linux ; non qualifiée sur les profils Node/Python du kit. Le worktree lié ne doit jamais être monté avec son `.git` accessible. |
+ | **Profil infrastructure Docker / VM (Inception)** | **Non qualifiée** | Nécessite un moteur Docker dédié ou une VM sans exposition du socket Docker de macOS. Concurrence et sécurité à qualifier séparément. |
+ | **Boucle bidirectionnelle contexte / test** | **Prévue** | Gestion des statuts « attend du contexte », reprise de session (`codex exec resume`, sessions Claude natives). Reprise Antigravity sans interface à qualifier. |
+ | **Superviseur indépendant (`scripts/supervise.sh`)** | **Prévue / Non qualifiée** | Processus indépendant sur le Mac (survie CLI, gestion quota, verrous fcntl, réveil sans appel modèle). Survie après veille ou relance macOS à qualifier avec `launchd`. |

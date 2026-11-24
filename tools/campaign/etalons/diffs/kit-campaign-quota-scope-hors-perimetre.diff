@@ -1,0 +1,103 @@
+diff --git a/tests/test_campaign.py b/tests/test_campaign.py
+--- a/tests/test_campaign.py
++++ b/tests/test_campaign.py
+@@ -305,3 +305,41 @@
+         self.assertEqual(rows[0]['status'], 'failed')
+         self.assertNotIn('failed_work', rows[0])
+         self.assertIn('--abandoned --force', (self.project / '.workspace/calls').read_text())
++
++    def test_evaluation_score_is_kept_when_it_fails_with_quota_word(self):
++        self.config.update(arms=['codex-seul'], repetitions=2)
++        self.config['tasks'][0]['evaluation_command'] = (
++            'for i in 1 2 3 4 5 6 7 8 9 10 11; do echo "ok $i"; done; '
++            'echo "not ok 12 quota projection"; exit 1')
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 0, result.stderr)
++        rows = self.rows()
++        self.assertEqual([r['status'] for r in rows], ['completed', 'completed'])
++        self.assertEqual((rows[0]['evaluation']['exit'], rows[0]['evaluation']['passed'],
++                          rows[0]['evaluation']['total']), (1, 11, 12))
++        self.assertNotIn('error', rows[0])
++        self.assertEqual(self.git('branch', '--show-current'), 'initial')
++
++    def test_gate_quota_word_is_not_a_limit(self):
++        self.config.update(arms=['codex-seul'], repetitions=1)
++        (self.project / 'scripts/gate.sh').write_text('echo "FAIL quota"; exit 1\n')
++        self.git('add', '.')
++        self.git('commit', '-qm', 'gate quota word')
++        self.config['start_commit'] = self.git('rev-parse', 'HEAD')
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 0, result.stderr)
++        row = self.rows()[0]
++        self.assertEqual(row['status'], 'completed')
++        self.assertEqual(row['gate']['exit'], 1)
++        self.assertEqual(row['evaluation']['passed'], 3)
++
++    def test_agent_quota_text_still_stops_the_campaign(self):
++        self.config.update(arms=['systeme-claude-haiku'], repetitions=1)
++        (self.project / 'scripts/delegate.sh').write_text("echo 'usage limit reached'; exit 1\n")
++        self.git('add', '.')
++        self.git('commit', '-qm', 'delegate quota text')
++        self.config['start_commit'] = self.git('rev-parse', 'HEAD')
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 75, result.stderr)
++        self.assertEqual([r['status'] for r in self.rows()], ['quota'])
++        self.assertEqual(self.git('branch', '--show-current'), 'initial')
+diff --git a/tools/campaign/campaign.py b/tools/campaign/campaign.py
+--- a/tools/campaign/campaign.py
++++ b/tools/campaign/campaign.py
+@@ -26,6 +26,8 @@
+ # « quota » seulement isolé : pas dans un identifiant, un chemin ou un champ JSON.
+ QUOTA_TEXT = re.compile(
+     r'rate[ _-]?limit|usage[ _-]?limit|resource_exhausted|too many requests|(?<![\w-])quota(?![\w-])', re.I)
++# Seuls ces scripts appellent un agent : leur texte de sortie peut signaler un vrai quota.
++AGENT_SCRIPTS = ('scripts/delegate.sh', 'scripts/prepare-task.sh', 'scripts/breaker.sh')
+ 
+ 
+ def records(path):
+@@ -134,13 +136,15 @@
+                     pass  # Journal append-only : ignorer une ligne partielle.
+             return events
+ 
+-    def command(self, args, check=True):
++    def command(self, args, check=True, quota=True):
+         proc = self.raw(args)
+         self.row['commands'].append(dict(args=args, exit=proc.returncode, output=proc.stdout))
+-        if any(event.get('quota', {}).get('limit_reached') is True for event in self.events()):
+-            raise Quota('Limite signalée dans consumption.jsonl')
+-        if proc.returncode and QUOTA_TEXT.search(proc.stdout):
+-            raise Quota(proc.stdout)
++        if quota:
++            if any(event.get('quota', {}).get('limit_reached') is True for event in self.events()):
++                raise Quota('Limite signalée dans consumption.jsonl')
++            # Seul un script qui appelle un agent peut signaler un quota par son texte.
++            if args[1:2] and args[1] in AGENT_SCRIPTS and proc.returncode and QUOTA_TEXT.search(proc.stdout):
++                raise Quota(proc.stdout)
+         if check and proc.returncode:
+             raise RuntimeError('Commande échouée (%s) : %s' % (proc.returncode, proc.stdout))
+         return proc
+@@ -202,7 +206,7 @@
+         return ids
+ 
+     def evaluate(self, task):
+-        gate = self.script('gate', check=False)
++        gate = self.script('gate', check=False, quota=False)
+         failures = [line for line in gate.stdout.splitlines()
+                     if re.search(r'FAIL|not ok|✗|×|❯', line)]
+         self.row['gate'] = dict(exit=gate.returncode, output=gate.stdout,
+@@ -221,7 +225,8 @@
+                 shutil.copyfile(str(source), str(dest))
+                 copied.append(dest)
+             command = task['evaluation_command']
+-            proc = self.command(command if isinstance(command, list) else ['bash', '-c', command], check=False)
++            proc = self.command(command if isinstance(command, list) else ['bash', '-c', command],
++                                check=False, quota=False)
+             passed, total = score(proc.stdout, proc.returncode)
+             self.row['evaluation'] = dict(exit=proc.returncode, passed=passed, total=total, output=proc.stdout)
+         finally:
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

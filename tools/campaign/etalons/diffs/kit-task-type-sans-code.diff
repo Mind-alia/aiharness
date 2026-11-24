@@ -1,0 +1,41 @@
+diff --git a/tests/test_task.py b/tests/test_task.py
+--- a/tests/test_task.py
++++ b/tests/test_task.py
+@@ -87,3 +87,37 @@
+         for path in ('../escape', '/tmp/test', 'a/../test', 'a//test'):
+             with self.subTest(path=path), self.assertRaises(ValueError):
+                 self.read(base + '\nacceptance: [' + path + ']\nacceptance_verify: true')
++
++    def test_type_accepts_each_listed_value(self):
++        base = 'id: demo\nagent: codex\nallowed: []'
++        for value in ('code', 'docs', 'test', 'security', 'exploration'):
++            with self.subTest(type=value):
++                self.assertEqual(self.read(base + '\ntype: ' + value)['type'], value)
++
++    def test_type_refuses_unknown_values(self):
++        base = 'id: demo\nagent: codex\nallowed: []'
++        for value in ('', 'Docs', 'CODE', 'documentation', 'code, docs'):
++            with self.subTest(type=value), self.assertRaisesRegex(ValueError, 'type'):
++                self.read(base + '\ntype: ' + value)
++
++    def test_type_defaults_from_mode_then_agent(self):
++        base = 'id: demo\nallowed: []'
++        self.assertEqual(self.read(base + '\nagent: codex\nmode: review')['type'], 'exploration')
++        self.assertEqual(self.read(base + '\nagent: antigravity')['type'], 'docs')
++        self.assertEqual(self.read(base + '\nagent: claude-haiku')['type'], 'code')
++        self.assertEqual(self.read(base + '\nagent: codex\nmode: write')['type'], 'code')
++
++    def test_type_default_priority_review_before_antigravity(self):
++        base = 'id: demo\nallowed: []'
++        self.assertEqual(self.read(base + '\nagent: antigravity\nmode: review')['type'], 'exploration')
++
++    def test_explicit_type_wins_over_defaults(self):
++        base = 'id: demo\nallowed: []'
++        self.assertEqual(self.read(base + '\nagent: codex\nmode: review\ntype: code')['type'], 'code')
++        self.assertEqual(self.read(base + '\nagent: antigravity\ntype: test')['type'], 'test')
++        self.assertEqual(self.read(base + '\nagent: codex\ntype: security')['type'], 'security')
++
++    def test_duplicate_type_is_rejected(self):
++        base = 'id: demo\nagent: codex\nallowed: []'
++        with self.assertRaisesRegex(ValueError, 'répété'):
++            self.read(base + '\ntype: code\ntype: docs')

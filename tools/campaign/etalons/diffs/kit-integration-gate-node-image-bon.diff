@@ -1,0 +1,226 @@
+diff --git a/template/docker/node-git.Dockerfile b/template/docker/node-git.Dockerfile
+new file mode 100644
+--- /dev/null
++++ b/template/docker/node-git.Dockerfile
+@@ -0,0 +1,13 @@
++# Image complète de la porte d'intégration pour les projets Node (porte de la console) : Node 24, python3, git
++# et Chromium de Playwright, pour que la porte passe dans le conteneur de la tâche.
++# Construction : docker build -t workspace-node-git:24-bookworm -f template/docker/node-git.Dockerfile template/docker
++# --only-shell : en mode sans tête, Playwright n'utilise que le Chromium « headless shell » ; l'image est plus légère.
++# Usage : choisie automatiquement pour le profil node quand elle existe localement (template/scripts/lib/sandbox.py).
++FROM node:24-bookworm-slim
++ARG PLAYWRIGHT_VERSION=1.64.0
++ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends python3 git ca-certificates procps \
++    && npx -y playwright@${PLAYWRIGHT_VERSION} install --with-deps --only-shell chromium \
++    && chmod -R a+rX /ms-playwright \
++    && rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*
+diff --git a/template/scripts/lib/sandbox.py b/template/scripts/lib/sandbox.py
+--- a/template/scripts/lib/sandbox.py
++++ b/template/scripts/lib/sandbox.py
+@@ -44,6 +44,10 @@
+ 
+ 
+ DEFAULT_IMAGE_NODE = 'node:24-bookworm-slim'
++DEFAULT_IMAGE_NODE_FULL = 'workspace-node-git:24-bookworm'
++NODE_FULL_BUILD_COMMAND = (
++    'docker build -t workspace-node-git:24-bookworm -f template/docker/node-git.Dockerfile template/docker'
++)
+ DEFAULT_IMAGE_PYTHON = 'python:3.12-slim-bookworm'
+ DEFAULT_CPUS = '2'
+ DEFAULT_MEMORY = '4g'
+@@ -106,7 +110,48 @@
+     return state, task_dir, worktree_path
+ 
+ 
+-def resolve_image_and_profile(root: Path, task_dir: Path, worktree_path: Path, state: Dict[str, Any]) -> Tuple[str, str]:
++def node_full_image_present(docker_bin: Optional[str]) -> bool:
++    docker = docker_bin or shutil.which('docker')
++    if not docker:
++        return False
++    try:
++        res = subprocess.run(
++            [docker, 'image', 'inspect', '--format', '{{.Id}}', DEFAULT_IMAGE_NODE_FULL],
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True
++        )
++    except OSError:
++        return False
++    return res.returncode == 0 and bool(res.stdout.strip())
++
++
++def select_node_image(docker_bin: Optional[str]) -> str:
++    if node_full_image_present(docker_bin):
++        return DEFAULT_IMAGE_NODE_FULL
++    print(
++        f"Image {DEFAULT_IMAGE_NODE_FULL} absente : repli sur {DEFAULT_IMAGE_NODE} "
++        f"(sans python3 ni git ; pour la porte complète : {NODE_FULL_BUILD_COMMAND})",
++        file=sys.stderr
++    )
++    return DEFAULT_IMAGE_NODE
++
++
++def select_image(profile: str, docker_bin: Optional[str]) -> str:
++    override = os.environ.get('WORKSPACE_IMAGE')
++    if override:
++        return override
++    if profile == 'node':
++        node_override = os.environ.get('WORKSPACE_IMAGE_NODE')
++        if node_override:
++            return node_override
++        return select_node_image(docker_bin)
++    return os.environ.get('WORKSPACE_IMAGE_PYTHON', DEFAULT_IMAGE_PYTHON)
++
++
++def resolve_image_and_profile(
++    root: Path, task_dir: Path, worktree_path: Path, state: Dict[str, Any], docker_bin: Optional[str] = None
++) -> Tuple[str, str]:
+     # Lecture des métadonnées de tâche d'origine si disponibles
+     task_data = {}
+     source_task = state.get('source_task')
+@@ -131,16 +176,7 @@
+         else:
+             profile = 'python'
+ 
+-    # Image
+-    if profile == 'node':
+-        image = os.environ.get('WORKSPACE_IMAGE_NODE', DEFAULT_IMAGE_NODE)
+-    else:
+-        image = os.environ.get('WORKSPACE_IMAGE_PYTHON', DEFAULT_IMAGE_PYTHON)
+-
+-    if os.environ.get('WORKSPACE_IMAGE'):
+-        image = os.environ['WORKSPACE_IMAGE']
+-
+-    return image, profile
++    return select_image(profile, docker_bin), profile
+ 
+ 
+ def node_heap_mb(memory: str) -> int:
+@@ -166,7 +202,7 @@
+     check_docker_engine(docker_bin)
+ 
+     state, task_dir, worktree_path = validate_and_load_task_state(root, task_id)
+-    image, profile = resolve_image_and_profile(root, task_dir, worktree_path, state)
++    image, profile = resolve_image_and_profile(root, task_dir, worktree_path, state, docker_bin)
+     network_mode = 'none'
+     container_name = get_container_name(root, task_id)
+ 
+@@ -418,7 +454,7 @@
+             docker = get_docker_binary()
+             check_docker_engine(docker)
+             state, task_dir, worktree = validate_and_load_task_state(root, task_id)
+-            image, profile = resolve_image_and_profile(root, task_dir, worktree, state)
++            image, profile = resolve_image_and_profile(root, task_dir, worktree, state, docker)
+             from deps import prepare_dependencies
+             prepare_dependencies(root, task_dir, worktree, image, profile, docker, rebuild)
+             return 0
+diff --git a/tests/test_sandbox.py b/tests/test_sandbox.py
+--- a/tests/test_sandbox.py
++++ b/tests/test_sandbox.py
+@@ -163,6 +163,11 @@
+     sys.exit(code)
+ elif sub == 'rm':
+     sys.exit(0)
++elif sub == 'image':
++    # Sans FAKE_IMAGE_ID : image absente (sortie vide, code 0), comme un vrai « image inspect » sans image.
++    if 'FAKE_IMAGE_ID' in os.environ:
++        print(os.environ['FAKE_IMAGE_ID'])
++    sys.exit(0)
+ else:
+     sys.exit(0)
+ '''.replace('__DOCKER_LOG__', str(self.docker_log_file))
+@@ -356,6 +361,92 @@
+         log_file2 = self.root / f'.workspace/orchestration/tasks/{task_id}/sandbox/exec-002.log'
+         self.assertTrue(log_file2.is_file())
+ 
++    def sandbox_run_call(self, res):
++        self.assertEqual(res.returncode, 0, res.stderr)
++        return next((c for c in self.get_docker_calls() if c and c[0] == 'run' and 'workspace.role=sandbox' in c), None)
++
++    def image_inspect_calls(self):
++        return [c for c in self.get_docker_calls() if c[:2] == ['image', 'inspect']]
++
++    def test_node_profile_prefers_full_image_when_present(self):
++        task_id = self.prepare_task('task-full', profile='node')
++        res = self.run_sandbox('start', task_id, env={'FAKE_IMAGE_ID': 'sha256:0123456789ab'})
++        run_call = self.sandbox_run_call(res)
++        self.assertIn('workspace-node-git:24-bookworm', run_call)
++        self.assertNotIn('node:24-bookworm-slim', run_call)
++        self.assertNotIn('workspace-node-git', res.stderr)
++        self.assertEqual(len(self.image_inspect_calls()), 1)
++
++    def test_node_profile_falls_back_with_one_build_hint_when_full_image_absent(self):
++        task_id = self.prepare_task('task-absent', profile='node')
++        res = self.run_sandbox('start', task_id)
++        run_call = self.sandbox_run_call(res)
++        self.assertIn('node:24-bookworm-slim', run_call)
++        self.assertNotIn('workspace-node-git:24-bookworm', run_call)
++        lines = res.stderr.strip().splitlines()
++        self.assertEqual(len(lines), 1)
++        self.assertIn(
++            'docker build -t workspace-node-git:24-bookworm -f template/docker/node-git.Dockerfile template/docker',
++            lines[0]
++        )
++
++    def test_empty_image_inspect_output_counts_as_absent(self):
++        task_id = self.prepare_task('task-empty-id', profile='node')
++        res = self.run_sandbox('start', task_id, env={'FAKE_IMAGE_ID': ''})
++        run_call = self.sandbox_run_call(res)
++        self.assertIn('node:24-bookworm-slim', run_call)
++        self.assertNotIn('workspace-node-git:24-bookworm', run_call)
++        self.assertEqual(len(res.stderr.strip().splitlines()), 1)
++
++    def test_workspace_image_wins_without_probing_docker(self):
++        task_id = self.prepare_task('task-override', profile='node')
++        res = self.run_sandbox(
++            'start', task_id,
++            env={'WORKSPACE_IMAGE': 'custom-any:1', 'WORKSPACE_IMAGE_NODE': 'custom-node:1', 'FAKE_IMAGE_ID': 'sha256:x'}
++        )
++        run_call = self.sandbox_run_call(res)
++        self.assertIn('custom-any:1', run_call)
++        self.assertEqual(self.image_inspect_calls(), [])
++        self.assertEqual(res.stderr, '')
++
++    def test_workspace_image_node_skips_probe(self):
++        task_id = self.prepare_task('task-node-override', profile='node')
++        res = self.run_sandbox(
++            'start', task_id,
++            env={'WORKSPACE_IMAGE_NODE': 'custom-node:1', 'FAKE_IMAGE_ID': 'sha256:x'}
++        )
++        run_call = self.sandbox_run_call(res)
++        self.assertIn('custom-node:1', run_call)
++        self.assertEqual(self.image_inspect_calls(), [])
++
++    def test_empty_workspace_image_node_is_treated_as_absent(self):
++        task_id = self.prepare_task('task-node-empty', profile='node')
++        res = self.run_sandbox(
++            'start', task_id,
++            env={'WORKSPACE_IMAGE_NODE': '', 'FAKE_IMAGE_ID': 'sha256:x'}
++        )
++        run_call = self.sandbox_run_call(res)
++        self.assertIn('workspace-node-git:24-bookworm', run_call)
++        self.assertEqual(len(self.image_inspect_calls()), 1)
++
++    def test_python_profile_never_probes_full_image(self):
++        task_id = self.prepare_task('task-py-noprobe', profile='python')
++        res = self.run_sandbox('start', task_id, env={'FAKE_IMAGE_ID': 'sha256:x'})
++        run_call = self.sandbox_run_call(res)
++        self.assertIn('python:3.12-slim-bookworm', run_call)
++        self.assertEqual(self.image_inspect_calls(), [])
++        self.assertEqual(res.stderr, '')
++
++    def test_node_full_dockerfile_starts_from_node_and_documents_build(self):
++        dockerfile = ROOT / 'template/docker/node-git.Dockerfile'
++        text = dockerfile.read_text(encoding='utf-8')
++        first_instruction = next(line for line in text.splitlines() if line and not line.startswith('#'))
++        self.assertEqual(first_instruction, 'FROM node:24-bookworm-slim')
++        self.assertIn(
++            'docker build -t workspace-node-git:24-bookworm -f template/docker/node-git.Dockerfile template/docker',
++            text
++        )
++
+     def test_stop_is_idempotent_and_preserves_worktree(self):
+         task_id = self.prepare_task('task-stop', profile='python')
+         self.assertEqual(self.run_sandbox('start', task_id).returncode, 0)

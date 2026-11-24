@@ -1,0 +1,95 @@
+diff --git a/tests/test_campaign.py b/tests/test_campaign.py
+--- a/tests/test_campaign.py
++++ b/tests/test_campaign.py
+@@ -484,3 +484,13 @@
+         self.assertEqual(result.returncode, 1)
+         self.assertIn('setup', result.stderr)
+         self.assertFalse((self.base / 'results.jsonl').exists())
++
++    def test_antigravity_system_arm_is_refused_before_any_run(self):
++        self.config['arms'] = ['systeme-antigravity']
++        result = self.run_campaign()
++        self.assertEqual(result.returncode, 1)
++        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
++        self.assertIn('campaign: ', result.stderr)
++        self.assertIn('systeme-antigravity', result.stderr)
++        self.assertIn('docs/ANTIGRAVITY-SANS-INTERACTION.md', result.stderr)
++        self.assertFalse((self.base / 'results.jsonl').exists())
+diff --git a/tests/test_campaign_evaluation.py b/tests/test_campaign_evaluation.py
+--- a/tests/test_campaign_evaluation.py
++++ b/tests/test_campaign_evaluation.py
+@@ -7,6 +7,8 @@
+ import unittest
+ 
+ SCRIPT = Path(__file__).resolve().parents[1] / 'tools/campaign/evaluation.py'
++sys.path.insert(0, str(SCRIPT.parent))
++from evaluation import score
+ 
+ EVALUATION = '''import unittest
+ import calc
+@@ -222,5 +224,20 @@
+         self.assertEqual(list(outside.iterdir()), [])
+ 
+ 
++class ScoreTests(unittest.TestCase):
++    def test_nested_vitest_tap_counts_only_leaves(self):
++        leaves = ['    %s %d - test %d' % ('not ok' if n == 5 else 'ok', n, n) for n in range(1, 13)]
++        leaves.insert(5, '      ---\n      error: attendu 2')
++        output = '\n'.join(['TAP version 13', 'ok 1 - tests/calc.test.ts {', '  ok 1 - calc {'] + leaves
++                           + ['  }', '}', '1..1', ''])
++        self.assertEqual(score(output, 1), (11, 12))
++
++    def test_flat_tap_is_unchanged(self):
++        self.assertEqual(score('ok 1 - a\nnot ok 2 - b\nok 3 - c # SKIP\n', 1), (2, 3))
++
++    def test_group_lines_alone_are_unknown(self):
++        self.assertEqual(score('ok 1 - fichier.test.ts {\n    ok 1 - groupe {\n    }\n}\n', 0), (None, None))
++
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tools/campaign/campaign.py b/tools/campaign/campaign.py
+--- a/tools/campaign/campaign.py
++++ b/tools/campaign/campaign.py
+@@ -85,6 +85,9 @@
+                 raise ValueError('Identifiant invalide : ' + name)
+         agents = ('codex', 'claude-opus', 'claude-sonnet', 'claude-haiku', 'antigravity')
+         for arm in self.config['arms']:
++            if arm == 'systeme-antigravity':
++                raise ValueError('Bras systeme-antigravity refusé : Antigravity ne lance aucune commande sans '
++                                 'interaction (docs/ANTIGRAVITY-SANS-INTERACTION.md)')
+             if arm not in ('opus-seul', 'codex-seul') and not (
+                     arm.startswith('systeme-') and arm[8:] in agents):
+                 raise ValueError('Bras invalide : ' + arm)
+diff --git a/tools/campaign/evaluation.py b/tools/campaign/evaluation.py
+--- a/tools/campaign/evaluation.py
++++ b/tools/campaign/evaluation.py
+@@ -22,15 +22,19 @@
+     return {}
+ 
+ 
++TAP_LEAF = re.compile(r'^[ \t]*(not ok|ok)[ \t]+\d+.*$', re.M)
++
++
+ def score(output, returncode):
+     """(passed, total) depuis un JSON {"passed", "total"}, TAP ou unittest ; (None, None) si inconnu, jamais inventé."""
+     data = json_output(output)
+     passed, total = data.get('passed'), data.get('total')
+     if passed is None or total is None:
+-        tap = re.findall(r'^\s*(not ok|ok)\s+\d+', output, re.M)
++        # Vitest imbrique une ligne par fichier et par groupe, ouverte par « { » : seules les feuilles comptent.
++        leaves = [m.group(1) for m in TAP_LEAF.finditer(output) if not m.group(0).rstrip().endswith('{')]
+         run = re.search(r'Ran (\d+) tests?', output)
+-        if tap:
+-            passed, total = tap.count('ok'), len(tap)
++        if leaves:
++            passed, total = leaves.count('ok'), len(leaves)
+         elif run:
+             total = int(run.group(1))
+             counts = dict(re.findall(r'(failures|errors|skipped)=(\d+)', output))
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

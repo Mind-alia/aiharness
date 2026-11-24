@@ -1,0 +1,352 @@
+diff --git a/template/scripts/lib/mission.py b/template/scripts/lib/mission.py
+--- a/template/scripts/lib/mission.py
++++ b/template/scripts/lib/mission.py
+@@ -36,6 +36,7 @@
+ from scope import matches
+ from mission_rules import SENSITIVE_PATHS, remove_prefix, is_relative_to_path, is_sensitive_pattern, validate_allowed_patterns, check_path_security, check_infrastructure_symlinks, patterns_overlap
+ from mission_git import run_git, verify_git_root, verify_git_head_and_clean, resolve_base_commit, prevalidate_branch_and_worktree
++from mission_retry import prepare_retry
+ import events
+ 
+ KNOWN_STATUSES = {'prepared', 'running', 'integrated', 'rejected', 'failed', 'abandoned', 'merged', 'merge_conflict', 'integration_failed', 'done'}
+@@ -65,7 +66,7 @@
+             raise ValueError(f"Motif invalide dans 'allowed' : {p}")
+ 
+ 
+-def read_registry_and_check_reservation(root: Path, new_task_id: str, new_allowed: List[str]) -> None:
++def read_registry_and_check_reservation(root: Path, new_task_id: str, new_allowed: List[str], skip_task_id: Optional[str] = None) -> None:
+     tasks_dir = root / '.workspace/orchestration/tasks'
+     if not tasks_dir.exists():
+         return
+@@ -97,6 +98,8 @@
+ 
+         registered_id = state['task_id']
+         if registered_id == new_task_id:
++            if registered_id == skip_task_id:
++                continue
+             raise ValueError(f"Une tâche avec cet identifiant est déjà existante et enregistrée dans le registre : {new_task_id}")
+ 
+         status = state['status']
+@@ -111,7 +114,7 @@
+                         )
+ 
+ 
+-def cmd_prepare(root: Path, task_file_arg: str, base_ref: Optional[str], caller_cwd: Path) -> int:
++def cmd_prepare(root: Path, task_file_arg: str, base_ref: Optional[str], caller_cwd: Path, retry: bool = False) -> int:
+     raw_task_path = Path(task_file_arg)
+     unresolved_task_path = raw_task_path if raw_task_path.is_absolute() else (caller_cwd / raw_task_path)
+ 
+@@ -186,7 +189,13 @@
+         except (BlockingIOError, OSError) as exc:
+             raise ValueError("Une autre opération prepare est en cours d'exécution.") from exc
+ 
+-        read_registry_and_check_reservation(root, task_id, allowed)
++        retry_attempt = None
++        if retry:
++            retry_attempt = prepare_retry(
++                root, task_id, lambda: load_task_state(root, task_id),
++                lambda: read_registry_and_check_reservation(root, task_id, allowed, skip_task_id=task_id))
++        else:
++            read_registry_and_check_reservation(root, task_id, allowed)
+ 
+         branch_name, worktree_path, state_file = prevalidate_branch_and_worktree(root, task_id)
+         target_existed_before = worktree_path.exists() or worktree_path.is_symlink()
+@@ -223,6 +232,8 @@
+                 "task_sha256": task_sha256,
+                 "source_task": rel_task
+             }
++            if retry_attempt is not None:
++                state_data["retry_of"] = f"{task_id}-tentative{retry_attempt}"
+ 
+             task_state_dir = tasks_dir / task_id
+             task_state_dir.mkdir(mode=0o700, exist_ok=True)
+@@ -235,7 +246,10 @@
+                 f.write('\n')
+             os.replace(tmp_state_file, state_file)
+             state_file.chmod(0o600)
+-            events.record(root, task_id, 'prepared', {'branch': branch_name, 'base_commit': base_commit})
++            prepared_detail = {'branch': branch_name, 'base_commit': base_commit}
++            if retry_attempt is not None:
++                prepared_detail['retry'] = retry_attempt
++            events.record(root, task_id, 'prepared', prepared_detail)
+ 
+             print(json.dumps(state_data, indent=2, ensure_ascii=False))
+             return 0
+@@ -655,7 +669,7 @@
+ def main() -> int:
+     os.umask(0o077)
+     if len(sys.argv) < 3:
+-        print("Usage : task-workspace.sh prepare <task.md> [--base REF] | status [<task-id>] | merge <id> [--no-verify-again] [--no-integration] [--message TEXT] | close <id> --merged|--abandoned [--keep-branch] [--force]", file=sys.stderr)
++        print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry] | status [<task-id>] | merge <id> [--no-verify-again] [--no-integration] [--message TEXT] | close <id> --merged|--abandoned [--keep-branch] [--force]", file=sys.stderr)
+         return 64
+ 
+     root = Path(sys.argv[1]).resolve()
+@@ -666,6 +680,7 @@
+         if action == 'prepare':
+             task_file_arg = None
+             base_ref = None
++            retry = False
+             idx = 3
+             while idx < len(sys.argv):
+                 arg = sys.argv[idx]
+@@ -678,16 +693,19 @@
+                 elif arg.startswith('--base='):
+                     base_ref = arg.partition('=')[2]
+                     idx += 1
++                elif arg == '--retry':
++                    retry = True
++                    idx += 1
+                 elif task_file_arg is None:
+                     task_file_arg = arg
+                     idx += 1
+                 else:
+-                    print("Usage : task-workspace.sh prepare <task.md> [--base REF]", file=sys.stderr)
++                    print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry]", file=sys.stderr)
+                     return 64
+             if task_file_arg is None:
+-                print("Usage : task-workspace.sh prepare <task.md> [--base REF]", file=sys.stderr)
++                print("Usage : task-workspace.sh prepare <task.md> [--base REF] [--retry]", file=sys.stderr)
+                 return 64
+-            return cmd_prepare(root, task_file_arg, base_ref, caller_cwd)
++            return cmd_prepare(root, task_file_arg, base_ref, caller_cwd, retry)
+         elif action == 'merge':
+             import argparse
+             parser = argparse.ArgumentParser(prog='task-workspace.sh merge')
+diff --git a/template/scripts/lib/mission_retry.py b/template/scripts/lib/mission_retry.py
+new file mode 100644
+--- /dev/null
++++ b/template/scripts/lib/mission_retry.py
+@@ -0,0 +1,104 @@
++"""Reprise d'un identifiant de tâche abandonnée (`prepare --retry`).
++
++Ne supprime rien : la branche est renommée, les dossiers d'état et d'exécution
++sont déplacés sous `.workspace/orchestration/archive/<id>-tentative<N>/`.
++Python 3.9+ standard library uniquement.
++"""
++import datetime
++import json
++import os
++from pathlib import Path
++import re
++from typing import Any, Callable, Dict, List, Tuple
++
++from mission_git import run_git
++from mission_rules import check_path_security
++
++ARCHIVE_REL = '.workspace/orchestration/archive'
++
++
++def _branch_exists(root: Path, branch: str) -> bool:
++    res = run_git(root, ['rev-parse', '--verify', '--quiet', '--end-of-options', 'refs/heads/' + branch], check=False)
++    return res.returncode == 0
++
++
++def _count_attempts(archive_dir: Path, task_id: str) -> int:
++    if not archive_dir.is_dir():
++        return 0
++    pattern = re.compile(re.escape(task_id) + r'-tentative\d+')
++    return sum(1 for entry in archive_dir.iterdir() if pattern.fullmatch(entry.name) and entry.is_dir())
++
++
++def _check_retry_preconditions(root: Path, task_id: str, load_state: Callable[[], Dict[str, Any]]) -> Tuple[int, Path, Path]:
++    state_file = root / '.workspace/orchestration/tasks' / task_id / 'state.json'
++    check_path_security(state_file.parent, root, "dossier d'état de la tâche")
++    if not state_file.exists() and not state_file.is_symlink():
++        raise ValueError(f"Refus de --retry : aucune tâche enregistrée pour {task_id}.")
++    status = load_state().get('status')
++    if status != 'abandoned':
++        raise ValueError(f"Refus de --retry : la tâche {task_id} est au statut '{status}' ; seule une tâche 'abandoned' se reprend.")
++
++    worktree = root / '.workspace/worktrees' / task_id
++    if worktree.exists() or worktree.is_symlink():
++        raise ValueError(f"Refus de --retry : le worktree {worktree} existe encore.")
++
++    archive_dir = root / ARCHIVE_REL
++    check_path_security(archive_dir, root, "dossier d'archive")
++    check_path_security(root / '.workspace/run/delegate' / task_id, root, "dossier d'exécution de la tâche")
++    attempt = _count_attempts(archive_dir, task_id) + 1
++    target = archive_dir / f"{task_id}-tentative{attempt}"
++    archived_branch = f"archive/workspace-task/{task_id}-tentative{attempt}"
++    if target.exists() or target.is_symlink():
++        raise ValueError(f"Refus de --retry : l'archive {target} existe déjà.")
++    if _branch_exists(root, archived_branch):
++        raise ValueError(f"Refus de --retry : la branche {archived_branch} existe déjà.")
++    return attempt, target, state_file
++
++
++def _write_state(state_file: Path, state: Dict[str, Any]) -> None:
++    tmp = state_file.with_name('state.json.retry.' + str(os.getpid()))
++    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
++    try:
++        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
++            json.dump(state, stream, indent=2, ensure_ascii=False)
++            stream.write('\n')
++        os.replace(tmp, state_file)
++    finally:
++        if tmp.exists():
++            tmp.unlink()
++
++
++def prepare_retry(root: Path, task_id: str, load_state: Callable[[], Dict[str, Any]],
++                  check_reservation: Callable[[], None]) -> int:
++    """Archive la tentative abandonnée de `task_id` et renvoie son numéro N (à appeler sous le verrou)."""
++    attempt, target, state_file = _check_retry_preconditions(root, task_id, load_state)
++    check_reservation()
++
++    branch = f"workspace-task/{task_id}"
++    archived_branch = f"archive/workspace-task/{task_id}-tentative{attempt}"
++    run_dir = root / '.workspace/run/delegate' / task_id
++    undo: List[Callable[[], None]] = []
++    try:
++        renamed = _branch_exists(root, branch)
++        if renamed:
++            run_git(root, ['branch', '-m', '--', branch, archived_branch])
++            undo.append(lambda: run_git(root, ['branch', '-m', '--', archived_branch, branch], check=False))
++        state = json.loads(state_file.read_text(encoding='utf-8'))
++        state['archived_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
++        state['archived_branch'] = archived_branch if renamed else None
++        _write_state(state_file, state)
++
++        target.parent.mkdir(mode=0o700, exist_ok=True)
++        target.parent.chmod(0o700)
++        os.replace(state_file.parent, target)
++        undo.append(lambda: os.replace(target, state_file.parent))
++        if run_dir.exists():
++            os.replace(run_dir, target / 'run')
++    except Exception:
++        for step in reversed(undo):
++            try:
++                step()
++            except Exception:
++                pass
++        raise
++    return attempt
+diff --git a/tests/test_task_workspace.py b/tests/test_task_workspace.py
+--- a/tests/test_task_workspace.py
++++ b/tests/test_task_workspace.py
+@@ -533,6 +533,125 @@
+         self.assertIn('déjà', result.stdout)
+         self.assertEqual(self.close_state(), before)
+ 
++    def registry_snapshot(self):
++        refs = self.git('for-each-ref', '--format=%(refname) %(objectname)')
++        files = sorted(str(p.relative_to(self.root)) for p in (self.root / '.workspace').rglob('*')
++                       if p.is_file() and 'tmp-tests' not in p.parts and p.name != 'events.jsonl')
++        return refs, files, self.close_state()
++
++    def test_retry_after_abandon_archives_previous_attempt(self):
++        worktree = self.prepare_close_task(commit=True)
++        old_tip = self.git('rev-parse', 'refs/heads/workspace-task/task-1').strip()
++        run_dir = self.root / '.workspace/run/delegate/task-1'
++        run_dir.mkdir(parents=True)
++        (run_dir / 'log.txt').write_text('first attempt\n')
++        self.assertEqual(self.run_cli('close', 'task-1', '--abandoned').returncode, 0)
++        self.write_task(body='Consigne modifiée')
++        result = self.run_cli('prepare', 'tasks/task-1.md', '--retry')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        state = self.close_state()
++        self.assertEqual(state['status'], 'prepared')
++        self.assertEqual(state['retry_of'], 'task-1-tentative1')
++        self.assertEqual(state['task_sha256'], hashlib.sha256((self.root / 'tasks/task-1.md').read_bytes()).hexdigest())
++        self.assertEqual(state['base_commit'], self.base_commit)
++        self.assertTrue(worktree.exists())
++        archive = self.root / '.workspace/orchestration/archive/task-1-tentative1'
++        archived = json.loads((archive / 'state.json').read_text())
++        self.assertEqual(archived['status'], 'abandoned')
++        self.assertEqual(archived['archived_branch'], 'archive/workspace-task/task-1-tentative1')
++        self.assertRegex(archived['archived_at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
++        self.assertEqual(archived['archived_at'][-1], 'Z')
++        self.assertEqual((archive / 'run/log.txt').read_text(), 'first attempt\n')
++        self.assertFalse(run_dir.exists())
++        self.assertEqual(stat.S_IMODE(archive.parent.stat().st_mode), 0o700)
++        self.assertEqual(self.git('rev-parse', 'refs/heads/archive/workspace-task/task-1-tentative1').strip(), old_tip)
++        self.assertEqual(self.git('rev-parse', 'refs/heads/workspace-task/task-1').strip(), self.base_commit)
++        events = [json.loads(line) for line in (self.root / '.workspace/events.jsonl').read_text().splitlines()]
++        prepared = [e for e in events if e['event'] == 'prepared']
++        self.assertNotIn('retry', prepared[0]['detail'])
++        self.assertEqual(prepared[1]['detail']['retry'], 1)
++
++    def test_retry_twice_numbers_attempts(self):
++        self.prepare_close_task()
++        for attempt in (1, 2):
++            self.assertEqual(self.run_cli('close', 'task-1', '--abandoned').returncode, 0)
++            result = self.run_cli('prepare', '--retry', 'tasks/task-1.md')
++            self.assertEqual(result.returncode, 0, result.stderr)
++            self.assertEqual(self.close_state()['retry_of'], f'task-1-tentative{attempt}')
++        archive_dir = self.root / '.workspace/orchestration/archive'
++        self.assertEqual(sorted(p.name for p in archive_dir.iterdir()), ['task-1-tentative1', 'task-1-tentative2'])
++        self.git('rev-parse', '--verify', 'refs/heads/archive/workspace-task/task-1-tentative1')
++        self.git('rev-parse', '--verify', 'refs/heads/archive/workspace-task/task-1-tentative2')
++
++    def test_retry_when_branch_was_deleted_by_hand(self):
++        self.prepare_close_task()
++        self.assertEqual(self.run_cli('close', 'task-1', '--abandoned').returncode, 0)
++        self.git('branch', '-D', 'workspace-task/task-1')
++        result = self.run_cli('prepare', 'tasks/task-1.md', '--retry')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        archived = json.loads((self.root / '.workspace/orchestration/archive/task-1-tentative1/state.json').read_text())
++        self.assertIsNone(archived['archived_branch'])
++
++    def test_retry_refused_on_prepared_task_changes_nothing(self):
++        self.prepare_close_task()
++        before = self.registry_snapshot()
++        result = self.run_cli('prepare', 'tasks/task-1.md', '--retry')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn('--retry', result.stderr)
++        self.assertIn('prepared', result.stderr)
++        self.assertEqual(self.registry_snapshot(), before)
++        self.assertFalse((self.root / '.workspace/orchestration/archive').exists())
++
++    def test_retry_refused_on_unknown_task(self):
++        self.write_task()
++        result = self.run_cli('prepare', 'tasks/task-1.md', '--retry')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn('--retry', result.stderr)
++        self.assertIn('aucune tâche', result.stderr)
++        self.assertFalse((self.root / '.workspace/worktrees/task-1').exists())
++
++    def test_prepare_without_retry_still_refuses_abandoned_id(self):
++        self.prepare_close_task()
++        self.assertEqual(self.run_cli('close', 'task-1', '--abandoned').returncode, 0)
++        before = self.registry_snapshot()
++        result = self.run_cli('prepare', 'tasks/task-1.md')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn('déjà', result.stderr)
++        self.assertEqual(self.registry_snapshot(), before)
++
++    def test_retry_refused_when_archive_target_exists(self):
++        self.prepare_close_task()
++        self.assertEqual(self.run_cli('close', 'task-1', '--abandoned').returncode, 0)
++        self.git('branch', 'archive/workspace-task/task-1-tentative1')
++        before = self.registry_snapshot()
++        result = self.run_cli('prepare', 'tasks/task-1.md', '--retry')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertEqual(self.registry_snapshot(), before)
++        self.git('rev-parse', '--verify', 'refs/heads/workspace-task/task-1')
++
++    def test_retry_refused_on_symlinked_archive_dir(self):
++        self.prepare_close_task()
++        self.assertEqual(self.run_cli('close', 'task-1', '--abandoned').returncode, 0)
++        elsewhere = self.root / 'elsewhere'
++        elsewhere.mkdir()
++        (self.root / '.workspace/orchestration/archive').symlink_to(elsewhere)
++        result = self.run_cli('prepare', 'tasks/task-1.md', '--retry')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertEqual(list(elsewhere.iterdir()), [])
++        self.assertEqual(self.close_state()['status'], 'abandoned')
++
++    def test_retry_still_refuses_overlap_with_other_active_task(self):
++        self.prepare_close_task()
++        self.assertEqual(self.run_cli('close', 'task-1', '--abandoned').returncode, 0)
++        self.write_task(rel_path='tasks/task-2.md', task_id='task-2', allowed=['src/**'])
++        self.assertEqual(self.run_cli('prepare', 'tasks/task-2.md').returncode, 0)
++        before = self.registry_snapshot()
++        result = self.run_cli('prepare', 'tasks/task-1.md', '--retry')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn('task-2', result.stderr)
++        self.assertEqual(self.registry_snapshot(), before)
++        self.git('rev-parse', '--verify', 'refs/heads/workspace-task/task-1')
++
+     def test_close_dirty_refused_then_force_logged(self):
+         worktree = self.prepare_close_task()
+         (worktree / 'untracked').write_text('save me')

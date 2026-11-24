@@ -1,0 +1,256 @@
+diff --git a/template/scripts/lib/questions.py b/template/scripts/lib/questions.py
+--- a/template/scripts/lib/questions.py
++++ b/template/scripts/lib/questions.py
+@@ -9,6 +9,21 @@
+ import time
+ 
+ import alerts
++import context
++import events
++
++ANSWER_ID_PATTERN = r'([a-z0-9-]+)/([0-9]{1,6})'
++ANSWER_BY_MAX_LENGTH = 64
++CONTROL_CHAR_LIMIT = 32
++DELETE_CHAR = 127
++
++
++class AnswerError(Exception):
++    """Réponse refusée : message d'une ligne et code de sortie."""
++
++    def __init__(self, message, code=1):
++        super().__init__(message)
++        self.code = code
+ 
+ 
+ def check_symlink(path, root=None):
+@@ -287,6 +302,71 @@
+         sys.exit(64)
+ 
+ 
++def check_answer_args(ident, text, by):
++    """Valide les arguments de `answer` ; renvoie (tâche, numéro sur trois chiffres)."""
++    match = re.fullmatch(ANSWER_ID_PATTERN, ident)
++    if match is None:
++        raise AnswerError("identifiant mal formé : attendu <tâche>/<numéro>", 64)
++    if not text.strip():
++        raise AnswerError("texte de réponse vide", 64)
++    if by is None or not by.strip():
++        raise AnswerError("--by absent ou vide", 64)
++    has_control = any(ord(char) < CONTROL_CHAR_LIMIT or ord(char) == DELETE_CHAR for char in by)
++    if len(by) > ANSWER_BY_MAX_LENGTH or has_control:
++        raise AnswerError("--by : 64 caractères au plus, sans caractère de contrôle", 64)
++    return match.group(1), f"{int(match.group(2)):03d}"
++
++
++def answer_paths(root, task_id, num_str):
++    """Question, copie de la question dans le worktree et réponse ; refus si un lien symbolique les touche."""
++    task_dir = root / '.workspace/orchestration/tasks' / task_id
++    worktree_exchange = root / '.workspace/worktrees' / task_id / '.workspace/exchange'
++    question = task_dir / 'context/questions' / f'{num_str}.md'
++    worktree_question = worktree_exchange / 'questions' / f'{num_str}.md'
++    answer = task_dir / 'context/answers' / f'{num_str}.md'
++    for path in (question, worktree_question, answer):
++        if check_symlink(path, root):
++            raise AnswerError(f"lien symbolique interdit : {path}")
++    return question, worktree_question, answer
++
++
++def write_reply(root, task_id, num_str, text, by, force):
++    """Écrit la réponse, puis journalise `question_answered`."""
++    question, worktree_question, answer = answer_paths(root, task_id, num_str)
++    if not (question.is_file() or worktree_question.is_file()):
++        raise AnswerError(f"question inconnue : {task_id}/{num_str}")
++    if answer.is_file() and not force:
++        raise AnswerError(f"déjà répondue ; --force pour remplacer : {task_id}/{num_str}")
++    try:
++        context.write_answer(root, task_id, int(num_str), text)
++    except (OSError, ValueError) as error:
++        raise AnswerError(f"écriture impossible : {error}") from error
++    events.record(root, task_id, 'question_answered', {'question': num_str, 'by': by, 'forced': force})
++    print(f"réponse écrite : {task_id}/{num_str} (par {by})")
++
++
++def parse_answer_args(argv):
++    parser = UsageArgumentParser(prog='questions.sh answer', description="Répond à une question d'agent")
++    parser.add_argument('ident', help="<tâche>/<numéro>")
++    parser.add_argument('text', help="Texte de la réponse")
++    parser.add_argument('--by', help="Auteur de la réponse (64 caractères au plus)")
++    parser.add_argument('--force', action='store_true', help="Remplace une réponse existante")
++    return parser.parse_args(argv)
++
++
++def answer_main(root, argv):
++    """Sous-commande `answer` ; `root` est la racine transmise par questions.sh."""
++    args = parse_answer_args(argv)
++    registry = context.registry_root(Path(root).resolve())
++    try:
++        task_id, num_str = check_answer_args(args.ident, args.text, args.by)
++        write_reply(registry, task_id, num_str, args.text, args.by, args.force)
++    except AnswerError as error:
++        print(f"questions.sh answer : {error}", file=sys.stderr)
++        return error.code
++    return 0
++
++
+ def parse_args(argv=None):
+     parser = UsageArgumentParser(description="Rappel des questions en attente")
+     parser.add_argument('roots', nargs='*', type=Path, help="Racines des projets")
+@@ -297,6 +377,9 @@
+ 
+ 
+ def main(argv=None):
++    argv = sys.argv[1:] if argv is None else argv
++    if len(argv) >= 2 and argv[0] == 'answer':
++        return answer_main(argv[1], argv[2:])
+     args = parse_args(argv)
+     roots = args.roots if args.roots else [Path.cwd()]
+ 
+diff --git a/template/scripts/questions.sh b/template/scripts/questions.sh
+--- a/template/scripts/questions.sh
++++ b/template/scripts/questions.sh
+@@ -3,6 +3,11 @@
+ set -eu
+ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ root=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
++
++if [ "${1-}" = answer ]; then
++  shift
++  exec python3 "$SCRIPT_DIR/lib/questions.py" answer "$root" "$@"
++fi
+ 
+ has_root=0
+ for arg do
+diff --git a/tests/test_questions.py b/tests/test_questions.py
+--- a/tests/test_questions.py
++++ b/tests/test_questions.py
+@@ -328,6 +328,130 @@
+         idx_t1 = res.stdout.index("task-1")
+         self.assertLess(idx_t2, idx_t1)
+ 
++    def make_task(self, task_id='demo', questions=('001',)):
++        task = self.root / '.workspace/orchestration/tasks' / task_id
++        (task / 'context/questions').mkdir(parents=True)
++        (task / 'state.json').write_text(json.dumps({"status": "running"}), encoding='utf-8')
++        for num in questions:
++            (task / 'context/questions' / f'{num}.md').write_text(f"Question {num} de {task_id}", encoding='utf-8')
++        return task
++
++    def read_events(self):
++        path = self.root / '.workspace/events.jsonl'
++        if not path.is_file():
++            return []
++        return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
++
++    def test_answer_writes_reply_and_event(self):
++        task = self.make_task()
++        res = self.run_questions('answer', 'demo/1', 'Réponse\nsur deux lignes', '--by', 'console')
++        self.assertEqual(res.returncode, 0, res.stderr)
++        self.assertEqual(res.stdout, "réponse écrite : demo/001 (par console)\n")
++        self.assertEqual((task / 'context/answers/001.md').read_text(encoding='utf-8'), 'Réponse\nsur deux lignes\n')
++        events = self.read_events()
++        self.assertEqual(len(events), 1)
++        self.assertEqual(events[0]['event'], 'question_answered')
++        self.assertEqual(events[0]['task_id'], 'demo')
++        self.assertEqual(events[0]['detail'], {'question': '001', 'by': 'console', 'forced': False})
++        self.assertNotIn("Question 001 de demo", self.run_questions().stdout)
++        self.assertEqual(self.run_questions('--short').stdout.strip(), "Aucune question en attente.")
++
++    def test_answer_copies_question_from_worktree(self):
++        task = self.make_task(questions=())
++        exchange = self.root / '.workspace/worktrees/demo/.workspace/exchange'
++        (exchange / 'questions').mkdir(parents=True)
++        (exchange / 'questions/002.md').write_text('Question de la copie', encoding='utf-8')
++        res = self.run_questions('answer', 'demo/002', 'OK', '--by', 'console')
++        self.assertEqual(res.returncode, 0, res.stderr)
++        self.assertEqual((task / 'context/answers/002.md').read_text(encoding='utf-8'), 'OK\n')
++        self.assertEqual((exchange / 'answers/002.md').read_text(encoding='utf-8'), 'OK\n')
++
++    def test_answer_usage_errors_exit_64_without_writing(self):
++        task = self.make_task()
++        cases = (
++            ('Demo/001', 'x', '--by', 'a'),
++            ('demo', 'x', '--by', 'a'),
++            ('demo/1234567', 'x', '--by', 'a'),
++            ('demo/', 'x', '--by', 'a'),
++            ('demo/001', '   ', '--by', 'a'),
++            ('demo/001', 'x'),
++            ('demo/001', 'x', '--by', ''),
++            ('demo/001', 'x', '--by', 'a' * 65),
++            ('demo/001', 'x', '--by', 'a\tb'),
++            ('demo/001', 'x', '--by', 'a', 'en trop'),
++        )
++        for args in cases:
++            with self.subTest(args=args):
++                res = self.run_questions('answer', *args)
++                self.assertEqual(res.returncode, 64, res.stderr)
++                self.assertEqual(res.stdout, '')
++                self.assertEqual(len(res.stderr.strip().splitlines()), 1)
++        self.assertFalse((task / 'context/answers').exists())
++        self.assertEqual(self.read_events(), [])
++
++    def test_answer_by_accepts_64_characters(self):
++        self.make_task()
++        res = self.run_questions('answer', 'demo/1', 'x', '--by', 'a' * 64)
++        self.assertEqual(res.returncode, 0, res.stderr)
++
++    def test_answer_refusals_exit_1_without_overwriting(self):
++        task = self.make_task()
++        res = self.run_questions('answer', 'demo/9', 'x', '--by', 'a')
++        self.assertEqual(res.returncode, 1)
++        self.assertIn('question inconnue', res.stderr)
++        self.run_questions('answer', 'demo/1', 'première', '--by', 'a')
++        res = self.run_questions('answer', 'demo/1', 'seconde', '--by', 'b')
++        self.assertEqual(res.returncode, 1)
++        self.assertIn('déjà répondue', res.stderr)
++        self.assertEqual((task / 'context/answers/001.md').read_text(encoding='utf-8'), 'première\n')
++        self.assertEqual(len(self.read_events()), 1)
++
++    def test_answer_force_replaces_and_marks_event(self):
++        task = self.make_task()
++        self.run_questions('answer', 'demo/1', 'première', '--by', 'a')
++        res = self.run_questions('answer', 'demo/1', 'seconde', '--by', 'b', '--force')
++        self.assertEqual(res.returncode, 0, res.stderr)
++        self.assertEqual(res.stdout, "réponse écrite : demo/001 (par b)\n")
++        self.assertEqual((task / 'context/answers/001.md').read_text(encoding='utf-8'), 'seconde\n')
++        events = self.read_events()
++        self.assertEqual([event['detail']['forced'] for event in events], [False, True])
++        self.assertEqual(events[1]['detail'], {'question': '001', 'by': 'b', 'forced': True})
++
++    def test_answer_refuses_symlinked_question_and_task(self):
++        task = self.make_task(questions=())
++        outside = self.root / 'outside'
++        (outside / 'questions').mkdir(parents=True)
++        (outside / 'questions/001.md').write_text('externe', encoding='utf-8')
++        (task / 'context/questions/001.md').symlink_to(outside / 'questions/001.md')
++        res = self.run_questions('answer', 'demo/1', 'x', '--by', 'a')
++        self.assertEqual(res.returncode, 1)
++        self.assertIn('lien symbolique', res.stderr)
++        self.assertFalse((task / 'context/answers/001.md').exists())
++
++        real = self.root / 'real-demo'
++        (real / 'context/questions').mkdir(parents=True)
++        (real / 'context/questions/003.md').write_text('question', encoding='utf-8')
++        (real / 'state.json').write_text(json.dumps({"status": "running"}), encoding='utf-8')
++        tasks = self.root / '.workspace/orchestration/tasks'
++        (tasks / 'linked').symlink_to(real, target_is_directory=True)
++        res = self.run_questions('answer', 'linked/3', 'x', '--by', 'a')
++        self.assertEqual(res.returncode, 1)
++        self.assertIn('lien symbolique', res.stderr)
++        self.assertFalse((real / 'context/answers/003.md').exists())
++        self.assertEqual(self.read_events(), [])
++
++    def test_answer_keeps_listing_options_unchanged(self):
++        self.make_task(questions=('001', '002'))
++        self.run_questions('answer', 'demo/1', 'ok', '--by', 'a')
++        self.assertEqual(self.run_questions('--short').stdout.strip(),
++                         "Questions en attente : 1 (dont 1 d'agents qui attendent)")
++        self.assertEqual(self.run_questions('--check').returncode, 1)
++        self.assertEqual(self.run_questions(str(self.root), '--short').stdout.strip(),
++                         "Questions en attente : 1 (dont 1 d'agents qui attendent)")
++        self.run_questions('answer', 'demo/2', 'ok', '--by', 'a')
++        self.assertEqual(self.run_questions('--short').stdout.strip(), "Aucune question en attente.")
++        self.assertEqual(self.run_questions('--check').returncode, 0)
++
+ 
+ if __name__ == '__main__':
+     unittest.main()

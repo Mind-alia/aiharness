@@ -1,0 +1,205 @@
+diff --git a/template/scripts/lib/prepare_task.py b/template/scripts/lib/prepare_task.py
+--- a/template/scripts/lib/prepare_task.py
++++ b/template/scripts/lib/prepare_task.py
+@@ -6,14 +6,18 @@
+ import re
+ import subprocess
+ import sys
++import signal
+ import tempfile
+ import time
+ 
+ sys.dont_write_bytecode = True
+ import consumption
++import procs
+ from task import read_task, safe_path, validate_acceptance_name
+ 
+ LIMIT = 1024 * 1024
++# Pid of the planner's process group while it runs, read by the signal handler.
++active = None
+ AGENTS = ('codex', 'antigravity', 'claude-haiku', 'claude-sonnet', 'claude-opus')
+ # Also available after tooling installation, which does not install the template docs.
+ STANDARD = "# Fiche de tâche\n\n## Besoin\nDécrire le comportement attendu et son utilité.\n\n## Interface imposée\nFixer les fichiers, noms exportés, signatures et formes des données.\n\n## Règles numérotées dans l'ordre d'application\n1. Décrire la première règle et sa priorité.\n2. Décrire les règles suivantes, sans ambiguïté.\n\n## Cas limites attendus\nLister les entrées vides, bornes, valeurs extrêmes et erreurs attendues.\n\n## Contrat strict\n- Objets stricts : refuser les champs inconnus.\n- Unions discriminées : imposer les champs propres à chaque variante.\n- Cohérence des dates : préciser ordre, validité et fuseaux.\n- Aucune valeur inventée : représenter explicitement l'inconnu.\n\n## Critères de conformité\nLister les comportements observables et les commandes de vérification.\nLes tests cachés restent hors du worktree, dans `.workspace/acceptance/<id>/`.\nL'en-tête facultatif associe `acceptance: [tests/cas.test.ts]` à\n`acceptance_verify: npx vitest run tests/cas.test.ts`.\n"
+@@ -116,6 +120,31 @@
+ ''' + standard_text + '\nDEMANDE :\n' + request
+ 
+ 
++def run_guarded(command, input=None, **kwargs):
++    """Run like subprocess.run, in its own session, with a guardian that empties the group if this process dies."""
++    global active
++    if input is not None:
++        kwargs['stdin'] = subprocess.PIPE
++    process = subprocess.Popen(command, start_new_session=True, **kwargs)
++    active = process.pid
++    guardian = None
++    try:
++        guardian = procs.start_guardian(process.pid)
++        stdout, stderr = process.communicate(input)
++        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
++    finally:
++        procs.kill_group(process.pid)
++        if guardian is not None:
++            procs.release_guardian(guardian)
++        active = None
++
++
++def interrupt(signum, frame):
++    if active is not None:
++        procs.kill_group(active)
++    raise KeyboardInterrupt
++
++
+ def call_planner(root, args, prompt):
+     env = dict(os.environ, WORKSPACE_ROLE='orchestration', WORKSPACE_TASK_ID=args.task_id)
+     env.pop('WORKSPACE_AGENT_ROOT', None)
+@@ -126,15 +155,19 @@
+         with tempfile.TemporaryDirectory(prefix='prepare-') as temporary:
+             source, answer = Path(temporary) / 'prompt.md', Path(temporary) / 'answer.json'
+             source.write_text(prompt, encoding='utf-8')
+-            process = subprocess.run(['bash', str(relay), 'review', str(source), str(answer)],
+-                                     cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
++            try:
++                process = run_guarded(['bash', str(relay), 'review', str(source), str(answer)],
++                                      cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
++            except FileNotFoundError:
++                return 3, ''
+             # The relay records consumption, including Codex event counters.
+             return process.returncode, answer.read_text(encoding='utf-8') if answer.is_file() else ''
+     started = time.monotonic()
+     try:
+-        process = subprocess.run(['claude', '-p', '--model', 'opus', '--permission-mode', 'plan',
+-                                  '--output-format', 'json', '--tools', 'Read,Glob,Grep'],
+-                                 input=prompt, capture_output=True, text=True, cwd=root, env=env)
++        process = run_guarded(['claude', '-p', '--model', 'opus', '--permission-mode', 'plan',
++                               '--output-format', 'json', '--tools', 'Read,Glob,Grep'],
++                              input=prompt, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                              text=True, cwd=root, env=env)
+     except FileNotFoundError:
+         return 3, ''
+     record = {}
+@@ -203,6 +236,8 @@
+     parser.add_argument('--executor', required=True, choices=AGENTS)
+     parser.add_argument('--planner', choices=('claude-opus', 'codex'), default='claude-opus')
+     args = parser.parse_args(argv)
++    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
++        signal.signal(sig, interrupt)
+     try:
+         if not re.fullmatch(r'[a-z0-9-]{1,100}', args.task_id):
+             raise ValueError('Identifiant invalide')
+@@ -222,6 +257,9 @@
+         for identifier, _, _ in outputs:
+             print(identifier)
+         return 0
++    except KeyboardInterrupt:
++        print('Préparation interrompue.', file=sys.stderr)
++        return 130
+     except (OSError, ValueError, TypeError, UnicodeError):
+         print('Préparation impossible : demande, réponse ou destination invalide.', file=sys.stderr)
+         return 2
+diff --git a/tests/test_prepare_task.py b/tests/test_prepare_task.py
+--- a/tests/test_prepare_task.py
++++ b/tests/test_prepare_task.py
+@@ -4,14 +4,26 @@
+ import os
+ from pathlib import Path
+ import shutil
++import signal
+ import subprocess
+ import sys
+ import tempfile
++import time
+ import unittest
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(ROOT / 'template/scripts/lib'))
+ from task import read_task
++
++
++def alive(pid):
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    return True
+ 
+ 
+ class PrepareTaskTests(unittest.TestCase):
+@@ -162,6 +174,70 @@
+         self.assertIn('ciblée', prompt)
+         self.assertIn('verify est une commande ciblée', prompt)
+ 
++    def start_hung_planner(self):
++        script = '#!' + sys.executable + '\nimport os, subprocess, sys, time\n'
++        script += "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
++        script += "open('pids.txt', 'w').write('%d %d' % (os.getpid(), child.pid))\n"
++        script += 'time.sleep(600)\n'
++        (self.bin / 'claude').write_text(script)
++        (self.bin / 'claude').chmod(0o700)
++        process = subprocess.Popen(['bash', 'scripts/prepare-task.sh', 'request.md', 'sum',
++                                    '--executor', 'claude-haiku'], cwd=self.root, env=self.env,
++                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++        self.addCleanup(self.stop, process)
++        return process
++
++    @staticmethod
++    def stop(process):
++        process.kill()
++        process.wait()
++        process.stdout.close()
++        process.stderr.close()
++
++    def wait_for_planner(self):
++        path = self.root / 'pids.txt'
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            pids = path.read_text().split() if path.is_file() else []
++            if len(pids) == 2:
++                pids = [int(pid) for pid in pids]
++                self.addCleanup(self.kill_quietly, pids)
++                return pids
++            time.sleep(0.05)
++        self.fail('Le faux planificateur ne démarre pas')
++
++    @staticmethod
++    def kill_quietly(pids):
++        for pid in pids:
++            try:
++                os.kill(pid, signal.SIGKILL)
++            except ProcessLookupError:
++                pass
++
++    def assert_gone(self, pids):
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline and any(alive(pid) for pid in pids):
++            time.sleep(0.05)
++        self.assertEqual([pid for pid in pids if alive(pid)], [])
++
++    def test_sigterm_stops_planner_group(self):
++        process = self.start_hung_planner()
++        pids = self.wait_for_planner()
++        process.send_signal(signal.SIGTERM)
++        _, stderr = process.communicate(timeout=10)
++        self.assertEqual(process.returncode, 130, stderr)
++        self.assertIn('Préparation interrompue.', stderr)
++        self.assert_gone(pids)
++        self.assertFalse((self.root / 'tasks').exists())
++
++    def test_sigkill_guardian_stops_planner_group(self):
++        process = self.start_hung_planner()
++        pids = self.wait_for_planner()
++        process.send_signal(signal.SIGKILL)
++        process.wait(timeout=10)
++        self.assertEqual(process.returncode, -signal.SIGKILL)
++        self.assert_gone(pids)
++
+     def test_install_circuit(self):
+         spec = importlib.util.spec_from_file_location('workspace_prepare_test', ROOT / 'scripts/workspace.py')
+         module = importlib.util.module_from_spec(spec)
+diff --git a/scripts/etalon-hors-perimetre.sh b/scripts/etalon-hors-perimetre.sh
+new file mode 100644
+--- /dev/null
++++ b/scripts/etalon-hors-perimetre.sh
+@@ -0,0 +1 @@
++exit 0

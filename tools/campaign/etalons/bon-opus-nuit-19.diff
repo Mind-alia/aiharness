@@ -1,0 +1,480 @@
+diff --git a/apps/service/src/domain/usage/quota-projection.test.ts b/apps/service/src/domain/usage/quota-projection.test.ts
+new file mode 100644
+index 0000000..b229666
+--- /dev/null
++++ b/apps/service/src/domain/usage/quota-projection.test.ts
+@@ -0,0 +1,202 @@
++import { describe, expect, it } from 'vitest';
++import { QuotaProjectionSchema, type QuotaProjection } from '@wsc/contracts';
++import {
++  QUOTA_PROJECTION_DROP_TOLERANCE_PERCENT,
++  QUOTA_PROJECTION_MAX_AGE_MS,
++  QUOTA_PROJECTION_MAX_DATE_MS,
++  QUOTA_PROJECTION_MIN_DATE_MS,
++  QUOTA_PROJECTION_MIN_INCREASE_PERCENT,
++  QUOTA_PROJECTION_MIN_SPAN_MS,
++  QUOTA_PROJECTION_RESET_TOLERANCE_MS,
++  projectQuota,
++  type QuotaObservation,
++} from './quota-projection.js';
++
++const NOW = new Date('2026-10-18T12:00:00.000Z');
++const RESET = '2026-10-18T15:00:00.000Z';
++
++function obs(time: string, percent: number, resetsAt = RESET): QuotaObservation {
++  return { at: `2026-10-18T${time}Z`, percent, resetsAt };
++}
++
++function project(observations: readonly QuotaObservation[], now = NOW): QuotaProjection {
++  const result = projectQuota(observations, now);
++  expect(QuotaProjectionSchema.parse(result)).toEqual(result);
++  return result;
++}
++
++function unknown(reason: string): QuotaProjection {
++  return { status: 'unknown', reason, fiabilite: 'inconnu' } as QuotaProjection;
++}
++
++function available(observedFrom: string, observedTo: string, exhaustedAt: string, resetsBeforeExhaustion: boolean): QuotaProjection {
++  return {
++    status: 'available',
++    exhaustedAt: `2026-10-18T${exhaustedAt}.000Z`,
++    observedFrom: `2026-10-18T${observedFrom}.000Z`,
++    observedTo: `2026-10-18T${observedTo}.000Z`,
++    fiabilite: 'estime',
++    resetsBeforeExhaustion,
++  };
++}
++
++describe('projectQuota', () => {
++  it('exposes the imposed thresholds', () => {
++    expect(QUOTA_PROJECTION_MAX_AGE_MS).toBe(30 * 60_000);
++    expect(QUOTA_PROJECTION_MIN_SPAN_MS).toBe(10 * 60_000);
++    expect(QUOTA_PROJECTION_RESET_TOLERANCE_MS).toBe(5 * 60_000);
++    expect(QUOTA_PROJECTION_MIN_INCREASE_PERCENT).toBe(1);
++    expect(QUOTA_PROJECTION_DROP_TOLERANCE_PERCENT).toBe(1);
++    expect(QUOTA_PROJECTION_MIN_DATE_MS).toBe(Date.parse('2000-01-01T00:00:00.000Z'));
++    expect(QUOTA_PROJECTION_MAX_DATE_MS).toBe(Date.parse('2100-01-01T00:00:00.000Z'));
++  });
++
++  it('projects exhaustion from the cycle ends (example 1)', () => {
++    expect(project([obs('11:00:00', 20), obs('11:30:00', 35), obs('12:00:00', 50)]))
++      .toEqual(available('11:00:00', '12:00:00', '13:40:00', false));
++  });
++
++  it('says the reset comes first when it does (example 2)', () => {
++    expect(project([obs('11:00:00', 20), obs('12:00:00', 30)]))
++      .toEqual(available('11:00:00', '12:00:00', '19:00:00', true));
++  });
++
++  it('counts a reset exactly at exhaustion as coming first', () => {
++    const reset = '2026-10-18T13:40:00Z';
++    expect(project([obs('11:00:00', 20, reset), obs('12:00:00', 50, reset)]))
++      .toEqual(available('11:00:00', '12:00:00', '13:40:00', true));
++  });
++
++  it('rounds the projected instant to the nearest millisecond', () => {
++    const result = project([obs('11:00:00', 0), obs('12:00:00', 3)]);
++    expect(result).toMatchObject({ status: 'available', exhaustedAt: '2026-10-19T20:20:00.000Z' });
++    const odd = project([obs('11:00:00', 0), obs('11:10:00.001', 7)], new Date('2026-10-18T11:10:00.001Z'));
++    expect(odd).toMatchObject({ status: 'available', exhaustedAt: new Date(Math.round(Date.parse('2026-10-18T11:10:00.001Z') + 93 / (7 / 600_001))).toISOString() });
++  });
++
++  it('handles empty input and an invalid now', () => {
++    expect(project([])).toEqual(unknown('insufficient_data'));
++    expect(project([], new Date(Number.NaN))).toEqual(unknown('invalid'));
++    expect(project([obs('11:00:00', 20), obs('12:00:00', 30)], new Date('nope'))).toEqual(unknown('invalid'));
++  });
++
++  it('needs two observations unless the window is already full', () => {
++    expect(project([obs('12:00:00', 40)])).toEqual(unknown('insufficient_data'));
++    expect(project([obs('12:00:00', 100)])).toEqual(available('12:00:00', '12:00:00', '12:00:00', false));
++  });
++
++  it('dates exhaustion at the first observation at 100 in the cycle', () => {
++    expect(project([obs('11:00:00', 20), obs('11:30:00', 100), obs('12:00:00', 100)]))
++      .toEqual(available('11:00:00', '11:30:00', '11:30:00', false));
++  });
++
++  it('needs at least ten minutes between the cycle ends', () => {
++    expect(project([obs('11:51:00', 20), obs('12:00:00', 30)])).toEqual(unknown('insufficient_data'));
++    expect(project([obs('11:50:00', 20), obs('12:00:00', 30)])).toMatchObject({ status: 'available' });
++  });
++
++  it('accepts a last observation exactly thirty minutes old and rejects an older one', () => {
++    expect(project([obs('11:00:00', 20), obs('11:30:00', 30)])).toMatchObject({ status: 'available', observedTo: '2026-10-18T11:30:00.000Z' });
++    expect(project([obs('10:30:00', 20), obs('11:00:00', 30)])).toEqual(unknown('stale'));
++  });
++
++  it('is stale when the announced reset is now or past', () => {
++    expect(project([obs('14:40:00', 20), obs('14:50:00', 30)], new Date(RESET)))
++      .toEqual(unknown('stale'));
++    expect(project([obs('11:40:00', 20, '2026-10-18T11:55:00Z'), obs('11:50:00', 30, '2026-10-18T11:55:00Z')]))
++      .toEqual(unknown('stale'));
++    expect(project([obs('11:40:00', 20, '2026-10-18T12:00:00Z'), obs('11:50:00', 30, '2026-10-18T12:00:00Z')]))
++      .toEqual(unknown('stale'));
++  });
++
++  it('reports flat consumption as not increasing', () => {
++    expect(project([obs('11:00:00', 40), obs('12:00:00', 40.5)])).toEqual(unknown('not_increasing'));
++    expect(project([obs('11:00:00', 0), obs('12:00:00', 0)])).toEqual(unknown('not_increasing'));
++    expect(project([obs('11:00:00', 40), obs('12:00:00', 41)])).toMatchObject({ status: 'available' });
++  });
++
++  it('reports a rate too slow to land before 2100 as not increasing', () => {
++    const slow = [{ at: '2000-01-01T00:00:00Z', percent: 0, resetsAt: RESET }, obs('12:00:00', 1)];
++    expect(project(slow)).toEqual(unknown('not_increasing'));
++  });
++
++  it('tolerates a one point drop and rejects a larger one', () => {
++    expect(project([obs('11:00:00', 20), obs('11:30:00', 36), obs('12:00:00', 35)])).toMatchObject({ status: 'available' });
++    expect(project([obs('11:00:00', 20), obs('11:30:00', 36), obs('12:00:00', 34.9)])).toEqual(unknown('invalid'));
++    expect(project([obs('11:00:00', 20), obs('11:30:00', 40), obs('12:00:00', 30)])).toEqual(unknown('invalid'));
++  });
++
++  it('tolerates a few seconds of jitter on the announced reset', () => {
++    expect(project([obs('11:00:00', 20, '2026-10-18T15:00:30Z'), obs('12:00:00', 50)]))
++      .toEqual(available('11:00:00', '12:00:00', '13:40:00', false));
++  });
++
++  it('rejects an older observation announcing a later reset', () => {
++    expect(project([obs('11:00:00', 20, '2026-10-18T16:00:00Z'), obs('12:00:00', 50)])).toEqual(unknown('reset_mismatch'));
++  });
++
++  it('rejects an observation of another cycle inside the current one', () => {
++    expect(project([obs('11:00:00', 20), obs('11:30:00', 90, '2026-10-18T11:45:00Z'), obs('12:00:00', 50)]))
++      .toEqual(unknown('reset_mismatch'));
++  });
++
++  it('ignores the observations of a previous cycle', () => {
++    const previous = [obs('09:00:00', 70, '2026-10-18T10:00:00Z'), obs('09:50:00', 90, '2026-10-18T10:00:00Z')];
++    expect(project([...previous, obs('11:00:00', 20), obs('12:00:00', 50)]))
++      .toEqual(available('11:00:00', '12:00:00', '13:40:00', false));
++    expect(project([...previous, obs('12:00:00', 40)])).toEqual(unknown('insufficient_data'));
++  });
++
++  it.each([-1, 100.5, Number.NaN, Number.POSITIVE_INFINITY])('rejects percent %s', percent => {
++    expect(project([obs('11:00:00', 20), obs('12:00:00', percent)])).toEqual(unknown('invalid'));
++  });
++
++  it.each([
++    'pas une date',
++    '2026-10-18',
++    '2026-10-18T15:00:00',
++    '',
++    '1999-12-31T23:59:59Z',
++    '2100-01-01T00:00:00Z',
++    '2026-02-30T15:00:00Z',
++    '2026-10-18T15:00Z',
++  ])('rejects the date %j as at or resetsAt', value => {
++    expect(project([obs('11:00:00', 20), { at: value, percent: 30, resetsAt: RESET }])).toEqual(unknown('invalid'));
++    expect(project([obs('11:00:00', 20), { ...obs('12:00:00', 30), resetsAt: value }])).toEqual(unknown('invalid'));
++  });
++
++  it('rejects an observation after now or a reset not after its observation', () => {
++    expect(project([obs('11:00:00', 20), obs('12:00:01', 30)])).toEqual(unknown('invalid'));
++    expect(project([obs('11:00:00', 20), obs('12:00:00', 30, '2026-10-18T12:00:00Z')])).toEqual(unknown('invalid'));
++    expect(project([obs('11:00:00', 20), obs('12:00:00', 30, '2026-10-18T11:59:00Z')])).toEqual(unknown('invalid'));
++  });
++
++  it('keeps one of identical duplicates and rejects conflicting ones', () => {
++    const duplicate = { at: '2026-10-18T14:00:00+02:00', percent: 50, resetsAt: '2026-10-18T17:00:00+02:00' };
++    expect(project([obs('11:00:00', 20), obs('12:00:00', 50), duplicate]))
++      .toEqual(available('11:00:00', '12:00:00', '13:40:00', false));
++    expect(project([obs('11:00:00', 20), obs('12:00:00', 50), obs('12:00:00', 51)])).toEqual(unknown('invalid'));
++    expect(project([obs('11:00:00', 20), obs('12:00:00', 50), obs('12:00:00', 50, '2026-10-18T15:00:30Z')])).toEqual(unknown('invalid'));
++  });
++
++  it('lets an invalid observation win over stale and insufficient data, and stale win over reset mismatch', () => {
++    expect(project([obs('10:00:00', 20), obs('10:30:00', -1)])).toEqual(unknown('invalid'));
++    expect(project([obs('12:00:00', 120)])).toEqual(unknown('invalid'));
++    expect(project([obs('10:00:00', 20, '2026-10-18T16:00:00Z'), obs('11:00:00', 50)])).toEqual(unknown('stale'));
++  });
++
++  it('normalises offset dates to UTC', () => {
++    const shifted = [
++      { at: '2026-10-18T13:00:00+02:00', percent: 20, resetsAt: '2026-10-18T17:00:00+02:00' },
++      { at: '2026-10-18T14:00:00+02:00', percent: 50, resetsAt: '2026-10-18T17:00:00+02:00' },
++    ];
++    expect(project(shifted)).toEqual(available('11:00:00', '12:00:00', '13:40:00', false));
++  });
++
++  it('does not depend on input order and leaves frozen input untouched', () => {
++    const ordered = [obs('11:00:00', 20), obs('11:30:00', 35), obs('12:00:00', 50)];
++    const frozen = Object.freeze([ordered[2], ordered[0], ordered[1]].map(item => Object.freeze({ ...item })));
++    expect(project(frozen)).toEqual(project(ordered));
++    expect(frozen.map(item => item.at)).toEqual(['2026-10-18T12:00:00Z', '2026-10-18T11:00:00Z', '2026-10-18T11:30:00Z']);
++  });
++});
+diff --git a/apps/service/src/domain/usage/quota-projection.ts b/apps/service/src/domain/usage/quota-projection.ts
+new file mode 100644
+index 0000000..af2471b
+--- /dev/null
++++ b/apps/service/src/domain/usage/quota-projection.ts
+@@ -0,0 +1,133 @@
++import type { QuotaProjection } from '@wsc/contracts';
++
++export const QUOTA_PROJECTION_MAX_AGE_MS = 30 * 60_000;
++export const QUOTA_PROJECTION_MIN_SPAN_MS = 10 * 60_000;
++export const QUOTA_PROJECTION_RESET_TOLERANCE_MS = 5 * 60_000;
++export const QUOTA_PROJECTION_MIN_INCREASE_PERCENT = 1;
++export const QUOTA_PROJECTION_DROP_TOLERANCE_PERCENT = 1;
++/** Plausible dates: from this instant included… */
++export const QUOTA_PROJECTION_MIN_DATE_MS = Date.UTC(2000, 0, 1);
++/** …to this instant excluded, the bounds of `StatuslineResetSchema`. */
++export const QUOTA_PROJECTION_MAX_DATE_MS = Date.UTC(2100, 0, 1);
++
++/** One status-line reading of a single quota window. */
++export interface QuotaObservation {
++  readonly at: string;
++  readonly percent: number;
++  readonly resetsAt: string;
++}
++
++type QuotaProjectionReason = Extract<QuotaProjection, { status: 'unknown' }>['reason'];
++
++interface Point {
++  readonly atMs: number;
++  readonly percent: number;
++  readonly resetMs: number;
++}
++
++// Same shape as `z.iso.datetime({ offset: true })`: seconds required, `Z` or `±hh:mm`.
++const ISO_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
++
++function unknown(reason: QuotaProjectionReason): QuotaProjection {
++  return { status: 'unknown', reason, fiabilite: 'inconnu' };
++}
++
++function iso(ms: number): string {
++  return new Date(ms).toISOString();
++}
++
++function parseInstant(value: string): number | null {
++  const match = ISO_DATETIME.exec(value);
++  if (!match) return null;
++  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
++  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
++  if (month < 1 || month > 12 || day < 1 || day > daysInMonth) return null;
++  const ms = Date.parse(value);
++  if (Number.isNaN(ms) || ms < QUOTA_PROJECTION_MIN_DATE_MS || ms >= QUOTA_PROJECTION_MAX_DATE_MS) return null;
++  return ms;
++}
++
++function toPoint(observation: QuotaObservation, nowMs: number): Point | null {
++  const atMs = parseInstant(observation.at);
++  const resetMs = parseInstant(observation.resetsAt);
++  const { percent } = observation;
++  if (atMs === null || resetMs === null) return null;
++  if (!Number.isFinite(percent) || percent < 0 || percent > 100) return null;
++  if (atMs > nowMs || resetMs <= atMs) return null;
++  return { atMs, percent, resetMs };
++}
++
++/** Sorted copy without identical duplicates; null when one instant carries two different readings. */
++function sortUnique(points: readonly Point[]): readonly Point[] | null {
++  const sorted = [...points].sort((a, b) => a.atMs - b.atMs);
++  const unique: Point[] = [];
++  for (const point of sorted) {
++    const previous = unique.at(-1);
++    if (previous?.atMs !== point.atMs) unique.push(point);
++    else if (previous.percent !== point.percent || previous.resetMs !== point.resetMs) return null;
++  }
++  return unique;
++}
++
++/** Trailing run announcing the reset `resetMs`; null when another cycle overlaps it or announces a later reset. */
++function currentCycle(points: readonly Point[], resetMs: number): readonly Point[] | null {
++  const inCycle = (point: Point) => Math.abs(point.resetMs - resetMs) <= QUOTA_PROJECTION_RESET_TOLERANCE_MS;
++  const start = points.findIndex(inCycle);
++  const cycle = points.slice(start);
++  const earlier = points.slice(0, start);
++  if (!cycle.every(inCycle)) return null;
++  if (!earlier.every(point => point.resetMs < resetMs - QUOTA_PROJECTION_RESET_TOLERANCE_MS)) return null;
++  return cycle;
++}
++
++function dropsTooMuch(cycle: readonly Point[]): boolean {
++  let max = -Infinity;
++  for (const point of cycle) {
++    if (point.percent < max - QUOTA_PROJECTION_DROP_TOLERANCE_PERCENT) return true;
++    max = Math.max(max, point.percent);
++  }
++  return false;
++}
++
++function projectCycle(cycle: readonly Point[], resetMs: number): QuotaProjection {
++  const first = cycle[0];
++  const last = cycle[cycle.length - 1];
++  const full = cycle.find(point => point.percent === 100);
++  if (full) {
++    const at = iso(full.atMs);
++    return { status: 'available', exhaustedAt: at, observedFrom: iso(first.atMs), observedTo: at, fiabilite: 'estime', resetsBeforeExhaustion: false };
++  }
++  const span = last.atMs - first.atMs;
++  if (cycle.length < 2 || span < QUOTA_PROJECTION_MIN_SPAN_MS) return unknown('insufficient_data');
++  const increase = last.percent - first.percent;
++  if (increase < QUOTA_PROJECTION_MIN_INCREASE_PERCENT) return unknown('not_increasing');
++  const exhaustedMs = Math.round(last.atMs + (100 - last.percent) / (increase / span));
++  if (exhaustedMs >= QUOTA_PROJECTION_MAX_DATE_MS) return unknown('not_increasing');
++  return {
++    status: 'available',
++    exhaustedAt: iso(exhaustedMs),
++    observedFrom: iso(first.atMs),
++    observedTo: iso(last.atMs),
++    fiabilite: 'estime',
++    resetsBeforeExhaustion: resetMs <= exhaustedMs,
++  };
++}
++
++/** Pure projection of when one quota window reaches 100 %, from its status-line observations. */
++export function projectQuota(observations: readonly QuotaObservation[], now: Date): QuotaProjection {
++  const nowMs = now.getTime();
++  if (Number.isNaN(nowMs)) return unknown('invalid');
++  const points = observations
++    .map(observation => toPoint(observation, nowMs))
++    .filter((point): point is Point => point !== null);
++  if (points.length !== observations.length) return unknown('invalid');
++  const sorted = sortUnique(points);
++  if (!sorted) return unknown('invalid');
++  const last = sorted.at(-1);
++  if (!last) return unknown('insufficient_data');
++  if (nowMs - last.atMs > QUOTA_PROJECTION_MAX_AGE_MS || last.resetMs <= nowMs) return unknown('stale');
++  const cycle = currentCycle(sorted, last.resetMs);
++  if (!cycle) return unknown('reset_mismatch');
++  if (dropsTooMuch(cycle)) return unknown('invalid');
++  return projectCycle(cycle, last.resetMs);
++}
+diff --git a/packages/contracts/src/usage.test.ts b/packages/contracts/src/usage.test.ts
+new file mode 100644
+index 0000000..81779f7
+--- /dev/null
++++ b/packages/contracts/src/usage.test.ts
+@@ -0,0 +1,76 @@
++import { describe, expect, it } from 'vitest';
++import { QUOTA_PROJECTION_REASONS, QuotaProjectionSchema, UsageWindowSchema } from './usage.js';
++
++const available = {
++  status: 'available',
++  exhaustedAt: '2026-10-18T13:40:00.000Z',
++  observedFrom: '2026-10-18T11:00:00.000Z',
++  observedTo: '2026-10-18T12:00:00.000Z',
++  fiabilite: 'estime',
++  resetsBeforeExhaustion: false,
++};
++const unknown = { status: 'unknown', reason: 'stale', fiabilite: 'inconnu' };
++const window = {
++  id: 'five_hour',
++  percent: 50,
++  resetsAt: '2026-10-18T15:00:00.000Z',
++  fiabilite: 'mesure',
++  observedAt: '2026-10-18T12:00:00.000Z',
++};
++
++describe('quota projection contract', () => {
++  it('accepts the available variant and every closed reason of the unknown variant', () => {
++    expect(QuotaProjectionSchema.parse(available)).toEqual(available);
++    expect(QUOTA_PROJECTION_REASONS).toEqual(['insufficient_data', 'stale', 'not_increasing', 'reset_mismatch', 'invalid']);
++    for (const reason of QUOTA_PROJECTION_REASONS) {
++      expect(QuotaProjectionSchema.safeParse({ ...unknown, reason }).success).toBe(true);
++    }
++  });
++
++  it('rejects unknown fields and fields of the other variant', () => {
++    expect(QuotaProjectionSchema.safeParse({ ...available, extra: 1 }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, extra: 1 }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, reason: 'stale' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, exhaustedAt: available.exhaustedAt }).success).toBe(false);
++  });
++
++  it('rejects a missing field, another fiabilite, status or reason', () => {
++    expect(QuotaProjectionSchema.safeParse({ ...available, resetsBeforeExhaustion: undefined }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, resetsBeforeExhaustion: 'false' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, fiabilite: 'mesure' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, fiabilite: 'inconnu' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, fiabilite: 'estime' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, status: 'pending' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...unknown, reason: 'other' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ status: 'unknown', fiabilite: 'inconnu' }).success).toBe(false);
++  });
++
++  it('accepts UTC dates with Z only', () => {
++    expect(QuotaProjectionSchema.safeParse({ ...available, exhaustedAt: '2026-10-18T15:40:00+02:00' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, observedFrom: '2026-10-18' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, observedTo: '2026-10-18T12:00:00' }).success).toBe(false);
++  });
++
++  it('requires observedFrom ≤ observedTo ≤ exhaustedAt, comparing instants', () => {
++    expect(QuotaProjectionSchema.safeParse({ ...available, observedFrom: '2026-10-18T12:00:01Z' }).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...available, exhaustedAt: '2026-10-18T11:59:59Z' }).success).toBe(false);
++    const equal = { ...available, observedFrom: '2026-10-18T12:00:00Z', observedTo: '2026-10-18T12:00:00.000Z', exhaustedAt: '2026-10-18T12:00:00.0Z' };
++    expect(QuotaProjectionSchema.safeParse(equal).success).toBe(true);
++  });
++
++  it('compares instants beyond the millisecond', () => {
++    const sameMs = { ...available, observedTo: '2026-10-18T12:00:00.0009Z', exhaustedAt: '2026-10-18T12:00:00.0001Z' };
++    expect(QuotaProjectionSchema.safeParse(sameMs).success).toBe(false);
++    expect(QuotaProjectionSchema.safeParse({ ...sameMs, observedFrom: '2026-10-18T12:00:00.00010Z', observedTo: '2026-10-18T12:00:00.0001Z' }).success).toBe(true);
++    expect(QuotaProjectionSchema.safeParse({ ...available, observedFrom: '2026-10-18T12:00:00.00001Z', observedTo: '2026-10-18T12:00:00Z' }).success).toBe(false);
++  });
++
++  it('adds an optional, never null, projection to a usage window that stays strict', () => {
++    expect(UsageWindowSchema.safeParse(window).success).toBe(true);
++    expect(UsageWindowSchema.parse({ ...window, projection: available }).projection).toEqual(available);
++    expect(UsageWindowSchema.safeParse({ ...window, projection: unknown }).success).toBe(true);
++    expect(UsageWindowSchema.safeParse({ ...window, projection: null }).success).toBe(false);
++    expect(UsageWindowSchema.safeParse({ ...window, projection: { ...unknown, reason: 'other' } }).success).toBe(false);
++    expect(UsageWindowSchema.safeParse({ ...window, extra: 1 }).success).toBe(false);
++  });
++});
+diff --git a/packages/contracts/src/usage.ts b/packages/contracts/src/usage.ts
+index 42cfb42..5ce3f8b 100644
+--- a/packages/contracts/src/usage.ts
++++ b/packages/contracts/src/usage.ts
+@@ -4,6 +4,38 @@ import { FiabiliteSchema, ProviderIdSchema } from './activity-event.js';
+ export const UsageWindowIdSchema = z.enum(['five_hour', 'seven_day']);
+ export type UsageWindowId = z.infer<typeof UsageWindowIdSchema>;
+ 
++export const QUOTA_PROJECTION_REASONS = ['insufficient_data', 'stale', 'not_increasing', 'reset_mismatch', 'invalid'] as const;
++
++/** `a ≤ b` for two `z.iso.datetime()` strings (UTC, seconds present), at full fractional precision unlike `Date.parse`. */
++function isNotAfter(a: string, b: string): boolean {
++  const [aSeconds, aFraction = ''] = a.slice(0, -1).split('.');
++  const [bSeconds, bFraction = ''] = b.slice(0, -1).split('.');
++  if (aSeconds !== bSeconds) return aSeconds < bSeconds;
++  const width = Math.max(aFraction.length, bFraction.length);
++  return aFraction.padEnd(width, '0') <= bFraction.padEnd(width, '0');
++}
++
++/** Estimated instant a quota window reaches 100 %, or an explicit unknown with its reason. */
++export const QuotaProjectionSchema = z.discriminatedUnion('status', [
++  z.strictObject({
++    status: z.literal('available'),
++    exhaustedAt: z.iso.datetime(),
++    observedFrom: z.iso.datetime(),
++    observedTo: z.iso.datetime(),
++    fiabilite: z.literal('estime'),
++    resetsBeforeExhaustion: z.boolean(),
++  }).refine(
++    p => isNotAfter(p.observedFrom, p.observedTo) && isNotAfter(p.observedTo, p.exhaustedAt),
++    { message: 'observedFrom ≤ observedTo ≤ exhaustedAt' },
++  ),
++  z.strictObject({
++    status: z.literal('unknown'),
++    reason: z.enum(QUOTA_PROJECTION_REASONS),
++    fiabilite: z.literal('inconnu'),
++  }),
++]);
++export type QuotaProjection = z.infer<typeof QuotaProjectionSchema>;
++
+ export const UsageWindowSchema = z.strictObject({
+   id: UsageWindowIdSchema,
+   percent: z.number().nullable(),
+@@ -12,6 +44,7 @@ export const UsageWindowSchema = z.strictObject({
+   observedAt: z.iso.datetime().nullable(),
+   /** True when `observedAt` is only bounded by the source file (the event carried no timestamp). */
+   observedAtApprox: z.boolean().optional(),
++  projection: QuotaProjectionSchema.optional(),
+ });
+ export type UsageWindow = z.infer<typeof UsageWindowSchema>;
+ 

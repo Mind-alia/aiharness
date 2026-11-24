@@ -1,0 +1,76 @@
+diff --git a/tests/test_campaign.py b/tests/test_campaign.py
+--- a/tests/test_campaign.py
++++ b/tests/test_campaign.py
+@@ -494,3 +494,72 @@
+         self.assertIn('systeme-antigravity', result.stderr)
+         self.assertIn('docs/ANTIGRAVITY-SANS-INTERACTION.md', result.stderr)
+         self.assertFalse((self.base / 'results.jsonl').exists())
++
++    def breaker_commands(self, rows):
++        return [c['args'] for r in rows for c in r['commands'] if c['args'][1:2] == ['scripts/breaker.sh']]
++
++    def test_breaker_agent_defaults_to_codex_explicitly(self):
++        self.config.update(arms=['codex-seul', 'systeme-claude-haiku'], repetitions=1)
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual({r['arm']: r['breaker_agent'] for r in rows},
++                         {'codex-seul': None, 'systeme-claude-haiku': 'codex'})
++        commands = self.breaker_commands(rows)
++        self.assertEqual(len(commands), 2)  # le faux prepare-task crée deux contrats par bras système
++        for args in commands:
++            self.assertEqual(args[3:], ['--promote', '--agent', 'codex'])
++
++    def test_breaker_agent_string_applies_to_every_system_arm(self):
++        self.config.update(arms=['codex-seul', 'opus-seul', 'systeme-claude-haiku', 'systeme-codex'], repetitions=1)
++        self.config['breaker_agent'] = 'claude-sonnet'
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual({r['arm']: r['breaker_agent'] for r in rows},
++                         {'codex-seul': None, 'opus-seul': None,
++                          'systeme-claude-haiku': 'claude-sonnet', 'systeme-codex': 'claude-sonnet'})
++        commands = self.breaker_commands(rows)
++        self.assertEqual(len(commands), 4)  # deux contrats par bras système
++        for args in commands:
++            self.assertEqual(args[3:], ['--promote', '--agent', 'claude-sonnet'])
++
++    def test_breaker_agent_object_is_per_arm_and_missing_arm_keeps_codex(self):
++        self.config.update(arms=['codex-seul', 'systeme-claude-haiku', 'systeme-codex'], repetitions=1)
++        self.config['breaker_agent'] = {'systeme-claude-haiku': 'claude-opus'}
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual({r['arm']: r['breaker_agent'] for r in rows},
++                         {'codex-seul': None, 'systeme-claude-haiku': 'claude-opus', 'systeme-codex': 'codex'})
++        for row in rows:
++            used = [c['args'][-1] for c in row['commands'] if c['args'][1:2] == ['scripts/breaker.sh']]
++            self.assertEqual(used, [row['breaker_agent']] * 2 if row['breaker_agent'] else [])
++
++    def test_single_agent_arms_never_run_the_breaker(self):
++        self.config.update(arms=['codex-seul', 'opus-seul'], repetitions=1)
++        self.config['breaker_agent'] = 'claude-haiku'
++        self.assertEqual(self.run_campaign().returncode, 0)
++        rows = self.rows()
++        self.assertEqual([r['breaker_agent'] for r in rows], [None, None])
++        self.assertEqual(self.breaker_commands(rows), [])
++
++    def test_invalid_breaker_agent_is_refused_before_any_run(self):
++        self.config['arms'] = ['codex-seul', 'systeme-claude-haiku']
++        doc = 'docs/ANTIGRAVITY-SANS-INTERACTION.md'
++        cases = [('antigravity', 'antigravity', doc),
++                 ({'systeme-claude-haiku': 'antigravity'}, 'antigravity', doc),
++                 ({'systeme-codex': 'codex'}, 'bras inconnu', 'systeme-codex'),
++                 ({'systeme-claude-haiku': 'gpt'}, 'invalide', 'gpt'),
++                 ('gpt', 'invalide', 'gpt'),
++                 (7, 'doit être', 'breaker_agent'),
++                 (['codex'], 'doit être', 'breaker_agent'),
++                 ({'systeme-claude-haiku': 3}, 'invalide', '3'),
++                 (None, 'doit être', 'breaker_agent')]
++        for value, message, detail in cases:
++            with self.subTest(value=value):
++                self.config['breaker_agent'] = value
++                result = self.run_campaign()
++                self.assertEqual(result.returncode, 1, result.stderr)
++                self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
++                self.assertIn('campaign: breaker_agent', result.stderr)
++                self.assertIn(message, result.stderr)
++                self.assertIn(detail, result.stderr)
++                self.assertFalse((self.base / 'results.jsonl').exists())
